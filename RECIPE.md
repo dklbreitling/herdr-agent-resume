@@ -4,7 +4,7 @@ Restarting the machine kills every agent. Herdr brings each terminal back as a b
 
 ![Agent resume](preview.png)
 
-(The preview is an illustration with made-up spaces and sessions. The mod itself shows only a short popup and a toast.)
+(A real screenshot of a demo Herdr window after a core restart and Ctrl+Shift+R: Claude Code and Codex back on their conversations, the toast at the bottom right. The Claude plan was masked. The mod itself shows only the short popup and the toast.)
 
 ## What you see
 

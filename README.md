@@ -13,7 +13,13 @@ This mod brings that back. Press **Ctrl+Shift+R** after a restart, and each term
 
 The agents open idle on their old conversation; nothing runs until you type. A toast says what came back.
 
-![Agent resume](preview.png)
+![Claude Code and Codex back on their conversations after a core restart, with the "Resumed 3 agents" toast](preview.png)
+
+Right after the key press, while the commands are typed into the restored shells:
+
+![The popup "Looking for agents to resume…" and the resume commands typed into two shells](docs/resuming.png)
+
+(Real screenshots of a demo Herdr window, taken with `herdr-app shot`. The shell prompt's user name and the Claude plan were masked.)
 
 ## Install
 
@@ -78,7 +84,7 @@ node --test tests/*.test.mjs                           # the toast text
 herdr-app check mods/agent-resume
 ```
 
-`scripts/preview.py` draws `preview.png`. `agent_resume.py` keeps the decisions in pure functions (`plan`, `lost`, `at_shell`, `command`, `placement`) so they can be tested without herdr-core. `main.js` is the popup: it runs one pass with `exec` and posts the toast built by `summary.js`.
+`agent_resume.py` keeps the decisions in pure functions (`plan`, `lost`, `at_shell`, `command`, `placement`) so they can be tested without herdr-core. `main.js` is the popup: it runs one pass with `exec` and posts the toast built by `summary.js`.
 
 Checked in a running Herdr app: with two Claude Code sessions and a Codex session open, `hc server stop` then `hc server start`, then Ctrl+Shift+R: all three came back on their conversations and the hooks noted them again.
 
