@@ -1,0 +1,203 @@
+import importlib.util
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest import mock
+
+spec = importlib.util.spec_from_file_location("agent_resume", Path(__file__).parents[1] / "mods/agent-resume/agent_resume.py")
+ar = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ar)
+
+BOOT = "boot-now"
+SID = "4f1c2a9e-7b3d-4e8a-9c51-2d6f0a8b3e17"
+SID2 = "019a2b7c-3d4e-7f10-8a2b-c3d4e5f60718"
+
+
+def label(agent="claude", session=SID, shell=100, boot=BOOT, at=1, cwd="/work", pid=200):
+    return {"agent": agent, "session": session, "cwd": cwd, "transcript": f"/t/{session}.jsonl",
+            "pid": pid, "shell": shell, "boot": boot, "at": at}
+
+
+def terminal(address="t1", pid=300, fg_pid=None, fg_name="fish", lbl=None, state="live", where="api / 1"):
+    labels = {"where": where}
+    if lbl is not None:
+        labels[ar.LABEL] = json.dumps(lbl)
+    return {"address": address, "state": state, "pid": pid, "labels": labels,
+            "foreground": {"pid": pid if fg_pid is None else fg_pid, "name": fg_name}}
+
+
+def run_plan(terminals, boot=BOOT, folder_ok=lambda p: True, file_ok=lambda p: True):
+    return ar.plan(terminals, boot, folder_ok=folder_ok, file_ok=file_ok)
+
+
+class LabelTests(unittest.TestCase):
+    def test_reads_a_valid_label(self):
+        self.assertEqual(ar.read_label({ar.LABEL: json.dumps(label())})["session"], SID)
+
+    def test_ignores_broken_or_foreign_labels(self):
+        for raw in ("not json", json.dumps([1]), json.dumps(label(agent="vim")),
+                    json.dumps(label(session="x; rm -rf ~")), json.dumps(label(session="short"))):
+            self.assertIsNone(ar.read_label({ar.LABEL: raw}), raw)
+        self.assertIsNone(ar.read_label({}))
+        self.assertIsNone(ar.read_label(None))
+
+
+class LostTests(unittest.TestCase):
+    def test_same_program_same_boot_is_not_lost(self):
+        self.assertFalse(ar.lost({"pid": 100}, label(shell=100), BOOT))
+
+    def test_another_program_is_lost(self):
+        self.assertTrue(ar.lost({"pid": 101}, label(shell=100), BOOT))
+
+    def test_another_boot_is_lost_even_with_a_reused_pid(self):
+        self.assertTrue(ar.lost({"pid": 100}, label(shell=100, boot="old"), BOOT))
+
+    def test_unknown_boot_falls_back_to_the_pid(self):
+        self.assertFalse(ar.lost({"pid": 100}, label(shell=100, boot=None), None))
+        self.assertTrue(ar.lost({"pid": None}, label(shell=100), BOOT))
+
+
+class ShellTests(unittest.TestCase):
+    def test_idle_shells(self):
+        for name in ("fish", "-fish", "bash", "/bin/zsh", "sh"):
+            self.assertTrue(ar.at_shell(terminal(fg_name=name)), name)
+
+    def test_busy_terminals(self):
+        self.assertFalse(ar.at_shell(terminal(fg_name="claude", fg_pid=301)))
+        self.assertFalse(ar.at_shell(terminal(fg_name="bash", fg_pid=301)))  # a nested shell
+        self.assertFalse(ar.at_shell(terminal(fg_name="vim")))
+        self.assertFalse(ar.at_shell({"pid": 300}))
+        self.assertFalse(ar.at_shell(terminal(pid=None)))
+
+
+class CommandTests(unittest.TestCase):
+    def test_claude_and_codex(self):
+        self.assertEqual(ar.command(label(cwd="/a b/c")), f"cd '/a b/c' && claude --resume {SID}")
+        self.assertEqual(ar.command(label(agent="codex", session=SID2)), f"cd '/work' && codex resume {SID2}")
+
+    def test_refuses_folders_that_cannot_be_typed_safely(self):
+        for cwd in ("/it's", "/back\\slash", "/new\nline", "relative", "", None):
+            self.assertIsNone(ar.command(label(cwd=cwd)), repr(cwd))
+
+
+class PlanTests(unittest.TestCase):
+    def test_resumes_a_lost_agent_at_an_idle_shell(self):
+        todo, skipped = run_plan([terminal(lbl=label(shell=100))])
+        self.assertEqual(skipped, [])
+        self.assertEqual(todo, [{"terminal": "t1", "where": "api / 1", "agent": "claude", "session": SID,
+                                 "cwd": "/work", "command": f"cd '/work' && claude --resume {SID}"}])
+
+    def test_leaves_running_and_unlabeled_terminals_alone(self):
+        todo, skipped = run_plan([terminal(lbl=label(shell=300)), terminal("t2"), terminal("t3", state="finished", lbl=label())])
+        self.assertEqual((todo, skipped), ([], []))
+
+    def test_skips_a_session_still_open_elsewhere(self):
+        todo, skipped = run_plan([terminal("t1", lbl=label(shell=100)), terminal("t2", pid=400, lbl=label(shell=400))])
+        self.assertEqual(todo, [])
+        self.assertEqual([(s["terminal"], s["reason"]) for s in skipped], [("t1", "open in another terminal")])
+
+    def test_resumes_one_session_once_newest_first(self):
+        todo, skipped = run_plan([terminal("t1", lbl=label(shell=1, at=5)), terminal("t2", pid=301, lbl=label(shell=2, at=9))])
+        self.assertEqual([t["terminal"] for t in todo], ["t2"])
+        self.assertEqual([(s["terminal"], s["reason"]) for s in skipped], [("t1", "resumed in another terminal")])
+
+    def test_reasons(self):
+        cases = [
+            (terminal(pid=None, lbl=label()), {}, ar.NOT_STARTED),
+            (terminal(fg_name="vim", lbl=label()), {}, "something else is running there"),
+            (terminal(lbl=label()), {"folder_ok": lambda p: False}, "its folder is gone"),
+            (terminal(lbl=label()), {"file_ok": lambda p: False}, "no saved conversation to resume"),
+            (terminal(lbl=label(cwd="/it's")), {}, "its folder name can't be typed safely"),
+        ]
+        for term, checks, reason in cases:
+            todo, skipped = run_plan([term], **checks)
+            self.assertEqual(todo, [])
+            self.assertEqual([s["reason"] for s in skipped], [reason])
+
+    def test_claude_and_codex_with_the_same_id_are_different_sessions(self):
+        todo, _ = run_plan([terminal("t1", lbl=label(shell=1)), terminal("t2", pid=301, lbl=label(agent="codex", shell=2))])
+        self.assertEqual(sorted(t["agent"] for t in todo), ["claude", "codex"])
+
+
+class ProcessTreeTests(unittest.TestCase):
+    # 50 hook sh -> 40 claude -> 30 fish (the terminal) -> 20 herdr-core -> 1
+    TREE = {50: (40, {"sh"}), 40: (30, {"claude"}), 30: (20, {"fish"}), 20: (1, {"herdr-core"}),
+            # 90 claude -p -> 80 bash (a tool) -> 40 claude
+            90: (80, {"claude"}), 80: (40, {"bash"}),
+            # 70 codex -> 60 node (codex.js) -> 30 fish
+            70: (60, {"codex"}), 60: (30, {"node"}),
+            # 15 claude in tmux -> 10 tmux server -> 1
+            15: (10, {"claude"}), 10: (1, {"tmux: server"})}
+
+    def lookup(self, pid):
+        if pid not in self.TREE:
+            return None
+        ppid, names = self.TREE[pid]
+        return {"ppid": ppid, "names": names, "start": None}
+
+    def test_finds_the_nearest_agent(self):
+        self.assertEqual(ar.find_agent("claude", 50, self.lookup), 40)
+        self.assertEqual(ar.find_agent("codex", 70, self.lookup), 70)
+        self.assertIsNone(ar.find_agent("codex", 50, self.lookup))
+
+    def test_placement(self):
+        self.assertEqual(ar.placement(40, 30, self.lookup), "direct")
+        self.assertEqual(ar.placement(70, 30, self.lookup), "direct")  # through codex's node wrapper
+        self.assertEqual(ar.placement(90, 30, self.lookup), "nested")
+        self.assertEqual(ar.placement(15, 30, self.lookup), "outside")
+        self.assertEqual(ar.placement(30, 30, self.lookup), "direct")  # the agent is the terminal's program
+
+
+class HookTests(unittest.TestCase):
+    ENV = {"HC_TERMINAL_ID": "t7"}
+
+    def payload(self, **extra):
+        return json.dumps({"hook_event_name": "SessionStart", "session_id": SID, "transcript_path": "/t/x.jsonl",
+                           "cwd": "/work", "source": "startup", **extra})
+
+    def test_guards(self):
+        self.assertEqual(ar.hook("claude", self.payload(), env={}), "not in a Herdr terminal")
+        self.assertEqual(ar.hook("claude", "{", env=self.ENV), "input is not JSON")
+        self.assertEqual(ar.hook("claude", self.payload(hook_event_name="Stop"), env=self.ENV), "not SessionStart")
+        self.assertEqual(ar.hook("claude", self.payload(agent_id="sub"), env=self.ENV), "subagent")
+        self.assertEqual(ar.hook("claude", self.payload(session_id="$(boom)"), env=self.ENV), "no usable session id")
+        self.assertEqual(ar.hook("claude", self.payload(transcript_path=None), env=self.ENV),
+                         "no transcript: the session can't be resumed")
+        self.assertEqual(ar.hook("codex", self.payload(), env={**self.ENV, "CODEX_THREAD_ID": SID2}), "codex sub-thread")
+
+    def test_saves_a_direct_session(self):
+        with mock.patch.object(ar, "find_agent", return_value=40), \
+             mock.patch.object(ar, "hc_json", return_value={"state": "live", "pid": 30}), \
+             mock.patch.object(ar, "placement", return_value="direct"), \
+             mock.patch.object(ar, "remember") as remember:
+            self.assertEqual(ar.hook("codex", self.payload(), env={**self.ENV, "CODEX_THREAD_ID": SID}), "saved")
+        remember.assert_called_once_with("t7", "codex", SID, "/work", "/t/x.jsonl", 40, 30)
+
+    def test_skips_nested_agents(self):
+        with mock.patch.object(ar, "find_agent", return_value=90), \
+             mock.patch.object(ar, "hc_json", return_value={"state": "live", "pid": 30}), \
+             mock.patch.object(ar, "placement", return_value="nested"), \
+             mock.patch.object(ar, "remember") as remember:
+            self.assertEqual(ar.hook("claude", self.payload(), env=self.ENV), "agent runs nested")
+        remember.assert_not_called()
+
+
+class ClaudeRegistryTests(unittest.TestCase):
+    def test_reads_a_running_session(self):
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, ".claude", "sessions"))
+            os.makedirs(os.path.join(home, ".claude", "projects", "-work"))
+            Path(home, ".claude", "projects", "-work", f"{SID}.jsonl").write_text("{}\n")
+            Path(home, ".claude", "sessions", "40.json").write_text(json.dumps(
+                {"pid": 40, "sessionId": SID, "cwd": "/work", "kind": "interactive"}))
+            self.assertEqual(ar.claude_session_of(40, home), (SID, "/work", os.path.join(home, ".claude", "projects", "-work", f"{SID}.jsonl")))
+            self.assertIsNone(ar.claude_session_of(41, home))
+            Path(home, ".claude", "sessions", "40.json").write_text(json.dumps(
+                {"pid": 40, "sessionId": SID, "cwd": "/work", "kind": "background"}))
+            self.assertIsNone(ar.claude_session_of(40, home))
+
+
+if __name__ == "__main__":
+    unittest.main()
