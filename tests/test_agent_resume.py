@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -80,6 +81,83 @@ class CommandTests(unittest.TestCase):
     def test_refuses_folders_that_cannot_be_typed_safely(self):
         for cwd in ("/it's", "/back\\slash", "/new\nline", "relative", "", None):
             self.assertIsNone(ar.command(label(cwd=cwd)), repr(cwd))
+
+
+class FlagTests(unittest.TestCase):
+    def test_keeps_claude_launch_flags_only(self):
+        argv = ["--model", "opus", "--dangerously-skip-permissions", "--resume", SID, "fix the bug",
+                "--add-dir", "/a", "/b", "--verbose", "-p", "--worktree", "w", "--permission-mode=plan", "--session-id", SID2]
+        self.assertEqual(ar.launch_flags("claude", argv), [["--model", "opus"], ["--dangerously-skip-permissions"],
+                                                           ["--add-dir", "/a", "/b"], ["--verbose"], ["--permission-mode=plan"]])
+
+    def test_keeps_flags_codex_resume_accepts(self):
+        argv = ["-m", "gpt-5", "-c", "model_reasoning_effort=high", "resume", SID2, "--full-auto",
+                "-s", "workspace-write", "--model=o3", "-i", "shot.png", "--cd", "/x"]
+        self.assertEqual(ar.launch_flags("codex", argv), [["-m", "gpt-5"], ["-c", "model_reasoning_effort=high"],
+                                                          ["-s", "workspace-write"], ["--model=o3"]])
+
+    def test_edge_cases(self):
+        self.assertEqual(ar.launch_flags("claude", ["--model"]), [])                     # no value
+        self.assertEqual(ar.launch_flags("claude", ["--model", "--verbose"]), [["--verbose"]])
+        self.assertEqual(ar.launch_flags("claude", ["--add-dir", "--verbose"]), [["--verbose"]])
+        self.assertEqual(ar.launch_flags("claude", ["--", "--model", "x"]), [])
+        self.assertEqual(ar.launch_flags("claude", ["--model", "x" * 5000]), [])
+        self.assertEqual(ar.launch_flags("claude", None), [])
+        self.assertEqual(len(ar.flat(ar.launch_flags("claude", ["--add-dir", *["/d"] * 200]))), 0)
+
+    def test_a_label_can_only_carry_kept_flags(self):
+        raw = label()
+        raw["args"] = ["--model", "x", "; rm -rf ~", "--evil", "--verbose"]
+        self.assertEqual(ar.read_label({ar.LABEL: json.dumps(raw)})["args"], ["--model", "x", "--verbose"])
+        raw["args"] = "--verbose"
+        self.assertEqual(ar.read_label({ar.LABEL: json.dumps(raw)})["args"], [])
+
+    def test_resume_command_with_flags(self):
+        lbl = {**label(), "args": ["--model", "opus", "--append-system-prompt", "be brief", "--dangerously-skip-permissions"]}
+        self.assertEqual(ar.command(lbl), f"cd '/work' && claude --resume {SID} --model opus "
+                                          "--append-system-prompt 'be brief' --dangerously-skip-permissions")
+        lbl["args"] = ["--append-system-prompt", "don't", "--model", "opus"]
+        self.assertEqual(ar.command(lbl), f"cd '/work' && claude --resume {SID} --model opus")  # can't be typed: left out
+        self.assertEqual(ar.resume_argv(lbl), ["claude", "--resume", SID, "--append-system-prompt", "don't", "--model", "opus"])
+        codex = {**label(agent="codex", session=SID2), "args": ["-c", "a=b", "-s", "workspace-write"]}
+        self.assertEqual(ar.command(codex), f"cd '/work' && codex resume {SID2} -c a=b -s workspace-write")
+
+
+class FailureTests(unittest.TestCase):
+    def test_last_words(self):
+        self.assertEqual(ar.last_words("$ claude --resume x\nNo conversation found with session ID: x\n\nuser@host ~> \n"),
+                         "No conversation found with session ID: x")
+        self.assertIsNone(ar.last_words("user@host ~>"))
+        self.assertIsNone(ar.last_words(""))
+
+    def test_start_failed(self):
+        back = terminal(pid=300, lbl=label(shell=100))
+        self.assertTrue(ar.start_failed(back, ar.read_label(back["labels"]), BOOT))
+        running = terminal(pid=300, fg_pid=301, fg_name="claude", lbl=label(shell=100))
+        self.assertFalse(ar.start_failed(running, ar.read_label(running["labels"]), BOOT))
+        noted = terminal(pid=300, lbl=label(shell=300))  # the hook noted it, then it was quit
+        self.assertFalse(ar.start_failed(noted, ar.read_label(noted["labels"]), BOOT))
+
+    def test_after(self):
+        env = {"HC_TERMINAL_ID": "t1"}
+        self.assertIsNone(ar.after("0", env=env))
+        self.assertIsNone(ar.after("130", env=env))  # Ctrl+C: quit on purpose
+        self.assertIsNone(ar.after("1", env={}))
+        with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}), \
+             mock.patch.object(ar, "boot_id", return_value=BOOT):
+            lost_term = terminal(pid=300, lbl=label(shell=100))
+            with mock.patch.object(ar, "hc_json", return_value=lost_term):
+                self.assertIsNone(ar.after("1", env=env))                 # no claim: `here` didn't start it
+                Path(ar._claim_path("claude", SID)).write_text("999999999 1")
+                self.assertIn("exited right away (code 1)", ar.after("1", env=env))
+                self.assertFalse(os.path.exists(ar._claim_path("claude", SID)))
+                Path(ar._claim_path("claude", SID)).write_text("999999999 1")
+                old = time.time() - 60
+                os.utime(ar._claim_path("claude", SID), (old, old))
+                self.assertIsNone(ar.after("1", env=env))                 # ran a minute: not a failed resume
+            Path(ar._claim_path("claude", SID)).write_text("999999999 1")
+            with mock.patch.object(ar, "hc_json", return_value=terminal(pid=300, lbl=label(shell=300))):
+                self.assertIsNone(ar.after("1", env=env))                 # the hook noted it
 
 
 class PlanTests(unittest.TestCase):

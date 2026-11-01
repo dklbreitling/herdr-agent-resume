@@ -76,6 +76,11 @@ class ShellTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not their end"):
             installer.without_block("x\n" + installer.BEGIN + "\nfoo\n")
 
+    def test_reports_a_failed_resume(self):
+        for shell, code in (("fish", "$status"), ("bash", "$?"), ("zsh", "$?")):
+            self.assertIn(f"here || command python3 '{self.SCRIPT}' after {code}" if shell != "fish"
+                          else f"here; or command python3 '{self.SCRIPT}' after {code}", installer.snippet(shell, self.SCRIPT))
+
     def test_refuses_a_path_with_a_quote(self):
         with self.assertRaises(ValueError):
             installer.snippet("fish", "/it's/agent_resume.py")

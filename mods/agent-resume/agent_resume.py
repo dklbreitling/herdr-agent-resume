@@ -13,6 +13,8 @@ This brings Claude Code and Codex sessions back, the way the Herdr TUI did:
   here                run by a shell as it starts (opt-in, see the installer's
                       --auto): when this terminal lost its agent, start it again
                       in place of typing anything
+  after CODE          run by the same shell when that agent exits with CODE:
+                      says so when it didn't come back (exited right away)
   adopt               note Claude Code sessions already running before the hook
                       was installed (from ~/.claude/sessions/<pid>.json)
   watch ...           internal: forget a session once its agent exits while the
@@ -34,21 +36,50 @@ AGENTS = {
     "claude": {"names": {"claude"}, "argv": lambda session: ["claude", "--resume", session]},
     "codex": {"names": {"codex"}, "argv": lambda session: ["codex", "resume", session]},
 }
+# Launch flags carried over to the resume command, with how many values each takes
+# ("+": one or more, up to the next flag). Only flags that set up how the agent runs
+# and that its resume command accepts; never ones that pick or start a session
+# (--resume, --continue, -p, --session-id, --worktree, a prompt, ...).
+KEEP_FLAGS = {
+    "claude": {
+        "--dangerously-skip-permissions": 0, "--allow-dangerously-skip-permissions": 0,
+        "--ide": 0, "--verbose": 0, "--strict-mcp-config": 0, "--chrome": 0, "--no-chrome": 0,
+        "--brief": 0, "--disable-slash-commands": 0,
+        "--model": 1, "--fallback-model": 1, "--permission-mode": 1, "--agent": 1, "--agents": 1,
+        "--settings": 1, "--setting-sources": 1, "--append-system-prompt": 1, "--system-prompt": 1,
+        "--effort": 1, "--autocompact": 1, "--plugin-dir": 1,
+        "--add-dir": "+", "--allowedTools": "+", "--allowed-tools": "+", "--disallowedTools": "+",
+        "--disallowed-tools": "+", "--mcp-config": "+", "--tools": "+", "--betas": "+",
+    },
+    "codex": {
+        "--oss": 0, "--search": 0, "--dangerously-bypass-approvals-and-sandbox": 0,
+        "--no-alt-screen": 0, "--approve-for-me": 0,
+        "-c": 1, "--config": 1, "-m": 1, "--model": 1, "-p": 1, "--profile": 1, "-s": 1, "--sandbox": 1,
+        "-a": 1, "--ask-for-approval": 1, "--add-dir": 1, "--enable": 1, "--disable": 1,
+        "--local-provider": 1,
+    },
+}
+MAX_ARGS = 64
+MAX_ARG_LEN = 1024
 AGENT_NAMES = set().union(*(a["names"] for a in AGENTS.values()))
 SHELLS = {"fish", "bash", "zsh", "sh", "dash", "ksh", "mksh"}
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,127}$")
 # Typed into a shell between single quotes: no quotes, backslashes or control characters.
 TYPABLE_PATH_RE = re.compile(r"^/[^'\\\x00-\x1f\x7f]*$")
+TYPABLE_ARG_RE = re.compile(r"^[^'\\\x00-\x1f\x7f]*$")
 
 SEND_GAP = 0.15      # seconds between two terminals, like the Herdr TUI's spacing
 SHELL_SETTLE = 1.5   # a restored shell runs this long before anything is typed into it
 START_WAIT = 12.0    # how long `resume` waits for restored shells that haven't started yet
 EXIT_GRACE = 2.0     # after an agent exits, wait this long before deciding it quit by itself
+VERIFY_WAIT = 5.0    # after typing, how long `resume` gives agents before checking they started
+QUICK_EXIT = 10.0    # an agent `here` started that exits sooner than this, with an error, failed
 HOOK_HC_TIMEOUT = 3  # the agent waits for its hook: never hold it up long
 LOG_LIMIT = 256 * 1024
 
 NOT_STARTED = "shell not started yet"
 BY_SHELL = "resumed by its shell"
+EXITED = "exited right away"
 
 
 class HcError(Exception):
@@ -192,6 +223,60 @@ def boot_id():
     return None
 
 
+def proc_argv(pid):
+    """A process's argv, or None where it can't be read exactly (only Linux has
+    /proc/<pid>/cmdline; `ps` joins the words with spaces)."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    return [a.decode("utf-8", "replace") for a in raw.split(b"\0")[:-1]] or None
+
+
+def launch_flags(agent, args):
+    """The launch flags in `args` (an argv without argv[0]) worth keeping on resume, as
+    groups: [flag, value, ...]. Everything else (session pickers, prompts, unknown
+    flags and their values) is left out."""
+    keep = KEEP_FLAGS[agent]
+    groups, i = [], 0
+    args = [a for a in (args or []) if isinstance(a, str)]
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            break
+        name, eq, inline = arg.partition("=")
+        arity = keep.get(name) if name.startswith("-") else None
+        if arity is None:
+            continue
+        if eq:
+            if arity != 0:
+                groups.append([arg])
+            continue
+        if arity == 0:
+            groups.append([arg])
+            continue
+        count = 1 if arity == 1 else len(args)
+        values = []
+        while i < len(args) and len(values) < count and not args[i].startswith("-"):
+            values.append(args[i])
+            i += 1
+        if values:
+            groups.append([arg, *values])
+    kept, size = [], 0
+    for group in groups:
+        if size + len(group) > MAX_ARGS or any(len(a) > MAX_ARG_LEN for a in group):
+            continue
+        kept.append(group)
+        size += len(group)
+    return kept
+
+
+def flat(groups):
+    return [a for group in groups for a in group]
+
+
 # ---------------------------------------------------------------- herdr-core
 
 def hc_path():
@@ -236,6 +321,8 @@ def read_label(labels):
         return None
     if not isinstance(value, dict) or value.get("agent") not in AGENTS or not valid_session(value.get("session")):
         return None
+    raw_args = value.get("args")
+    value["args"] = flat(launch_flags(value["agent"], raw_args)) if isinstance(raw_args, list) else []
     return value
 
 
@@ -328,9 +415,12 @@ def hook(agent, raw, env=None):
 
 
 def remember(term, agent, session, cwd, transcript, agent_pid, shell):
-    """Label the terminal with the session and start its watcher."""
+    """Label the terminal with the session (and the agent's launch flags) and start its watcher."""
     label = {"agent": agent, "session": session, "cwd": cwd, "transcript": transcript,
              "pid": agent_pid, "shell": shell, "boot": boot_id(), "at": int(time.time() * 1000)}
+    argv = proc_argv(agent_pid)
+    if argv:
+        label["args"] = flat(launch_flags(agent, argv[1:]))
     hc(["label", term, f"{LABEL}={json.dumps(label, separators=(',', ':'), ensure_ascii=False)}"], timeout=HOOK_HC_TIMEOUT)
     subprocess.Popen([sys.executable, os.path.abspath(__file__), "watch", term, str(agent_pid), str(shell)],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -428,12 +518,26 @@ def starting_agent(terminal, agent):
     return bool(names & AGENTS[agent]["names"]) or "agent_resume.py" in names
 
 
+def resume_argv(label, typable_only=False):
+    """The resume command as an argv: the agent's own resume words, then its launch
+    flags. `typable_only` leaves out flags with a value that can't go between single
+    quotes (a quote, a backslash, a control character)."""
+    groups = launch_flags(label["agent"], label.get("args") or [])
+    if typable_only:
+        groups = [g for g in groups if all(TYPABLE_ARG_RE.match(a) for a in g)]
+    return AGENTS[label["agent"]]["argv"](label["session"]) + flat(groups)
+
+
+def _quote(arg):
+    return arg if re.match(r"^[A-Za-z0-9_@%+=:,./-]+$", arg) else f"'{arg}'"
+
+
 def command(label):
     """What to type, or None when the folder can't be typed safely."""
     cwd = label.get("cwd")
     if not isinstance(cwd, str) or not TYPABLE_PATH_RE.match(cwd):
         return None
-    return f"cd '{cwd}' && " + " ".join(AGENTS[label["agent"]]["argv"](label["session"]))
+    return f"cd '{cwd}' && " + " ".join(_quote(a) for a in resume_argv(label, typable_only=True))
 
 
 def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile):
@@ -495,6 +599,33 @@ def gather():
         return [t for t in pool.map(get, live) if t]
 
 
+def last_words(screen):
+    """The last line an agent printed before the shell's prompt came back, or None."""
+    lines = [line.strip() for line in (screen or "").splitlines() if line.strip()]
+    return lines[-2][:160] if len(lines) >= 2 else None
+
+
+def start_failed(terminal, label, boot):
+    """True when a resume typed into this terminal is over without the agent coming up:
+    the shell is in front again and no hook noted the session under it."""
+    return at_shell(terminal) and (label is None or lost(terminal, label, boot))
+
+
+def failed_start(address, boot):
+    """Why the agent typed into `address` didn't start, or None when it did (or still runs)."""
+    try:
+        terminal = hc_json(["get", address])
+    except HcError:
+        return None
+    if not start_failed(terminal, read_label(terminal.get("labels")), boot):
+        return None
+    try:
+        said = last_words(hc(["read", address]))
+    except HcError:
+        said = None
+    return f"{EXITED}: {said}" if said else EXITED
+
+
 def resume(dry_run=False, wait=START_WAIT):
     lock = runtime_lock("resume")
     if lock is None:
@@ -530,6 +661,13 @@ def resume(dry_run=False, wait=START_WAIT):
             continue
         resumed.append(item)
         log("resume", terminal=item["terminal"], where=item["where"], agent=item["agent"], session=item["session"])
+    if resumed:
+        time.sleep(VERIFY_WAIT)
+        for item in list(resumed):
+            why = failed_start(item["terminal"], boot)
+            if why:
+                resumed.remove(item)
+                skipped.append({**item, "reason": why})
     for item in skipped:
         log("skip", terminal=item["terminal"], agent=item["agent"], session=item["session"], reason=item["reason"])
     return {"resumed": resumed, "skipped": skipped}
@@ -595,9 +733,80 @@ def decide_here(terminal, shell_pid, boot, folder_ok=os.path.isdir, file_ok=os.p
     return label, None
 
 
+def _exit_code(status):
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    return 128 + os.WTERMSIG(status) if os.WIFSIGNALED(status) else 1
+
+
+def _default_signals():
+    """Python ignores SIGPIPE and SIGXFSZ; an exec'd program would inherit that."""
+    import signal
+    for name in ("SIGPIPE", "SIGXFSZ"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_DFL)
+
+
+def run_as_job(argv, cwd):
+    """Run the agent as the terminal's foreground job and wait for it. For shells that
+    run startup code without job control (fish does, from its prompt event): there the
+    agent would share the shell's process group, so Herdr would see the shell in front
+    and Ctrl+Z couldn't work. Returns the agent's exit code."""
+    import signal
+    tty = sys.stdin.fileno()
+    shell_group = os.getpgrp()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setpgid(0, 0)
+            signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            os.tcsetpgrp(tty, os.getpgrp())
+            signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+            _default_signals()
+            os.chdir(cwd)
+            os.execvp(argv[0], argv)
+        except OSError as error:
+            sys.stderr.write(f"agent-resume: couldn't start {argv[0]}: {error}\n")
+        os._exit(127)
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        os.setpgid(pid, pid)
+    except OSError:
+        pass
+    try:
+        os.tcsetpgrp(tty, pid)
+    except OSError:
+        pass
+    while True:
+        _, status = os.waitpid(pid, os.WUNTRACED)
+        if os.WIFSTOPPED(status):  # Ctrl+Z: there's no shell job to park it in, so go on
+            try:
+                os.tcsetpgrp(tty, pid)
+                os.killpg(pid, signal.SIGCONT)
+            except OSError:
+                pass
+            continue
+        break
+    try:
+        os.tcsetpgrp(tty, shell_group)
+    except OSError:
+        pass
+    return _exit_code(status)
+
+
+def needs_own_job():
+    """True when this process shares the shell's process group, i.e. the shell runs it
+    without job control."""
+    try:
+        return os.isatty(0) and os.getpgrp() == os.getpgid(os.getppid())
+    except OSError:
+        return False
+
+
 def here(env=None, shell_pid=None):
-    """Called by a starting shell. Execs the agent when its terminal lost one; returns
-    why not otherwise."""
+    """Called by a starting shell. Starts the agent when its terminal lost one and
+    returns its exit code; returns why not otherwise."""
     env = os.environ if env is None else env
     term = env.get("HC_TERMINAL_ID")
     if not term:
@@ -610,12 +819,15 @@ def here(env=None, shell_pid=None):
         return why
     if not claim(label["agent"], label["session"]):
         return "resumed in another terminal"
-    argv = AGENTS[label["agent"]]["argv"](label["session"])
+    argv = resume_argv(label)
     where = (terminal.get("labels") or {}).get("where")
     log("here", terminal=term, where=where, agent=label["agent"], session=label["session"])
-    sys.stderr.write(f"\033[2magent-resume: {' '.join(argv)} in {label['cwd']}\033[0m\n")
+    sys.stderr.write(f"\033[2magent-resume: {' '.join(_quote(a) for a in argv)} in {label['cwd']}\033[0m\n")
     sys.stderr.flush()
     try:
+        if needs_own_job():
+            return run_as_job(argv, label["cwd"])
+        _default_signals()
         os.chdir(label["cwd"])
         os.execvp(argv[0], argv)
     except OSError as error:
@@ -624,6 +836,36 @@ def here(env=None, shell_pid=None):
         except OSError:
             pass
         return f"couldn't start {argv[0]}: {error}"
+
+
+def after(code, env=None):
+    """The shell runs this when the agent `here` started exits with an error. When that
+    was quick and no hook noted the session, the resume failed: say so in the terminal
+    and the log. Returns the line printed, or None."""
+    env = os.environ if env is None else env
+    term = env.get("HC_TERMINAL_ID")
+    if not term or not code or code in ("0", "130", "143"):  # fine, Ctrl+C, SIGTERM: quit on purpose
+        return None
+    terminal = hc_json(["get", term], timeout=HOOK_HC_TIMEOUT)
+    label = read_label(terminal.get("labels"))
+    if not label or not lost(terminal, label, boot_id()):
+        return None
+    path = _claim_path(label["agent"], label["session"])
+    try:
+        ran = time.time() - os.path.getmtime(path)
+    except OSError:
+        return None
+    if claim_holder(label["agent"], label["session"]):
+        return None
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    if ran > QUICK_EXIT:
+        return None
+    log("failed", terminal=term, agent=label["agent"], session=label["session"], code=code)
+    return (f"agent-resume: {label['agent']} exited right away (code {code}), so session "
+            f"{label['session']} didn't come back. Ctrl+Shift+R tries again.")
 
 
 # ---------------------------------------------------------------- CLI
@@ -656,9 +898,20 @@ def main(argv):
             outcome = here()
         except Exception as error:  # never break the shell starting up
             outcome = f"error: {error}"
+        if isinstance(outcome, int):
+            return outcome  # the agent ran as a job: its exit code, for `after`
         if outcome.startswith(("couldn't", "error")):
             log("here", terminal=os.environ.get("HC_TERMINAL_ID"), outcome=outcome)
             sys.stderr.write(f"agent-resume: {outcome}\n")
+        return 0
+    if command_name == "after":
+        try:
+            line = after(argv[2] if len(argv) > 2 else "")
+        except Exception as error:
+            line = None
+            log("after", terminal=os.environ.get("HC_TERMINAL_ID"), outcome=f"error: {error}")
+        if line:
+            sys.stderr.write(f"\033[33m{line}\033[0m\n")
         return 0
     if command_name in ("resume", "status", "adopt"):
         try:

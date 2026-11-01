@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parents[1]
 MOD_NAME = "agent-resume"
 PACKAGE = "herdr-agent-resume"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MARKER = ".agent-resume-install.json"
 FILES = ("main.js", "summary.js", "mod.json", "agent_resume.py")
 GENERATED = {"gpui-kit.d.ts", "jsconfig.json", "__pycache__"}
@@ -37,7 +37,9 @@ SNIPPETS = {
     "fish": """if status is-interactive; and set -q HC_TERMINAL_ID
     function __agent_resume --on-event fish_prompt
         functions -e __agent_resume
-        test "$AGENT_RESUME_AUTO" != 0; and test -f '{script}'; and command python3 '{script}' here
+        if test "$AGENT_RESUME_AUTO" != 0; and test -f '{script}'
+            command python3 '{script}' here; or command python3 '{script}' after $status
+        end
     end
 end
 """,
@@ -45,7 +47,9 @@ end
     __agent_resume() {
         PROMPT_COMMAND="${PROMPT_COMMAND/__agent_resume;/}"
         unset -f __agent_resume
-        [[ "$AGENT_RESUME_AUTO" != 0 && -f '{script}' ]] && command python3 '{script}' here
+        if [[ "$AGENT_RESUME_AUTO" != 0 && -f '{script}' ]]; then
+            command python3 '{script}' here || command python3 '{script}' after $?
+        fi
     }
     PROMPT_COMMAND="__agent_resume;${PROMPT_COMMAND}"
 fi
@@ -54,7 +58,9 @@ fi
     __agent_resume() {
         add-zsh-hook -d precmd __agent_resume
         unfunction __agent_resume
-        [[ "$AGENT_RESUME_AUTO" != 0 && -f '{script}' ]] && command python3 '{script}' here
+        if [[ "$AGENT_RESUME_AUTO" != 0 && -f '{script}' ]]; then
+            command python3 '{script}' here || command python3 '{script}' after $?
+        fi
     }
     autoload -Uz add-zsh-hook && add-zsh-hook precmd __agent_resume
 fi

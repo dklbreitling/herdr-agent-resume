@@ -8,10 +8,10 @@ This mod brings that back. Press **Ctrl+Shift+R** after a restart, and each term
 
 | Was running | Typed into the restored shell |
 |---|---|
-| Claude Code | `cd '<folder>' && claude --resume <session>` |
-| Codex | `cd '<folder>' && codex resume <session>` |
+| Claude Code | `cd '<folder>' && claude --resume <session> [flags]` |
+| Codex | `cd '<folder>' && codex resume <session> [flags]` |
 
-The agents open idle on their old conversation; nothing runs until you type. A toast says what came back.
+The agents open idle on their old conversation, with the flags they were started with (`--model`, `--dangerously-skip-permissions`, `-s workspace-write`, ...); nothing runs until you type. A toast says what came back, and which ones didn't, with the agent's own error when one exits right away.
 
 Or skip the key press: install with `--auto` and each restored terminal starts its agent again by itself, as soon as its shell is up (fish, bash, zsh). See [Automatic resume](#automatic-resume).
 
@@ -53,7 +53,7 @@ python3 herdr-agent-resume/scripts/install.py --auto      # or --update --auto
 - **bash:** a block at the end of `~/.bashrc`;
 - **zsh:** a block at the end of `~/.zshrc` (or `$ZDOTDIR/.zshrc`).
 
-Each file is backed up first. At its first prompt, an interactive shell in a Herdr terminal runs `agent_resume.py here`. When that terminal lost its agent, it starts the agent again, in the session's folder: `claude --resume <id>` or `codex resume <id>`. It types nothing, so nothing lands in your shell history. Every other shell (a new tab, a nested shell, a terminal that didn't lose anything) carries on as usual, after one quick `hc get`.
+Each file is backed up first. At its first prompt, an interactive shell in a Herdr terminal runs `agent_resume.py here`. When that terminal lost its agent, it starts the agent again, in the session's folder, with its flags: `claude --resume <id> ...` or `codex resume <id> ...`, as the terminal's foreground job. It types nothing, so nothing lands in your shell history. If the agent exits right away with an error (say, the session is gone), a yellow line says so under the agent's message; Ctrl+Shift+R tries again. Every other shell (a new tab, a nested shell, a terminal that didn't lose anything) carries on as usual, after one quick `hc get`.
 
 Set `AGENT_RESUME_AUTO=0` to pause it for a while. `--no-auto` (with `--update`) takes the lines out again; `--uninstall` does too. Ctrl+Shift+R keeps working for terminals that weren't at a shell, and stays quiet about the ones their shell already brought back.
 
@@ -63,9 +63,9 @@ No layout change is needed. Linux and macOS, Python 3.8+ (standard library only)
 
 Three small pieces, all in `mods/agent-resume/agent_resume.py`:
 
-1. **A SessionStart hook** (`hook claude|codex`). Every time an agent starts a session in a Herdr terminal (start, `/resume`, `/clear`, compact), it writes the session on that terminal as an `agent-resume` label in herdr-core: agent, session id, folder, transcript, the agent's process and the terminal's shell process, and the boot. Labels live with the terminal and survive a reboot.
+1. **A SessionStart hook** (`hook claude|codex`). Every time an agent starts a session in a Herdr terminal (start, `/resume`, `/clear`, compact), it writes the session on that terminal as an `agent-resume` label in herdr-core: agent, session id, folder, transcript, launch flags, the agent's process and the terminal's shell process, and the boot. Labels live with the terminal and survive a reboot.
 2. **A watcher** (`watch`, started by the hook, one per agent process). It sleeps until the agent exits. If the terminal's shell is still the same process afterwards, you quit the agent yourself, so it removes the label: a session you quit stays quit. If the shell went with it (reboot, logout, core restart, pane closed), the label stays.
-3. **The resume pass** (`resume`, what Ctrl+Shift+R runs; with `--auto`, each restored shell runs `here` for itself instead). A terminal needs its agent back when its label is from another boot, or its shell is a different process than the one the agent ran under. Then, if it sits at an idle shell, the pass types the resume command into it (`hc send`), 150 ms apart. It waits up to 12 s for restored shells that haven't started yet.
+3. **The resume pass** (`resume`, what Ctrl+Shift+R runs; with `--auto`, each restored shell runs `here` for itself instead). A terminal needs its agent back when its label is from another boot, or its shell is a different process than the one the agent ran under. Then, if it sits at an idle shell, the pass types the resume command into it (`hc send`), 150 ms apart. It waits up to 12 s for restored shells that haven't started yet, and 5 s after typing, it checks each agent is up: a terminal back at its shell with no session noted failed, and the toast quotes the last line the agent printed.
 
 It skips, and says why:
 - a terminal running something else;
@@ -87,6 +87,7 @@ It also never notes:
 - With Ctrl+Shift+R, the resume command is typed into your shell, so it lands in your shell history. `--auto` doesn't type anything.
 - A folder Claude Code hasn't been told to trust stops at its trust prompt. Folders you worked in are trusted already.
 - `claude --resume` may continue under a new session id. The hook follows it, since every start is noted.
+- **Which flags come back.** Only flags that set up how the agent runs and that its resume command accepts: for Claude Code, `--model`, `--permission-mode`, `--dangerously-skip-permissions`, `--add-dir`, `--settings`, `--mcp-config`, `--allowedTools`, `--append-system-prompt` and a few more; for Codex, `-m`, `-c`, `-p`, `-s`, `-a`, `--add-dir`, `--search`, `--dangerously-bypass-approvals-and-sandbox` and a few more (not `--full-auto`, which `codex resume` doesn't take). Never a prompt, `--resume`/`--continue`, `-p`/`--print`, `--worktree` or `--session-id`. The full list is `KEEP_FLAGS` in `agent_resume.py`. With Ctrl+Shift+R, a flag whose value has a quote or a backslash is left out, since it can't be typed safely; `--auto` keeps it. Flags are read from `/proc`, so on macOS they don't come back yet.
 - Supported agents: Claude Code and Codex. Shells: fish, bash, zsh, sh, dash, ksh (`--auto`: fish, bash, zsh).
 - Codex notes a session at its first message, not when it opens.
 - Like the Herdr TUI's resume, this relies on how each agent CLI resumes today. If a CLI changes its flags or its hook input, it can break.
@@ -107,7 +108,7 @@ herdr-app check mods/agent-resume
 
 Checked in a running Herdr app: with two Claude Code sessions and a Codex session open, `hc server stop` then `hc server start`, then Ctrl+Shift+R: all three came back on their conversations and the hooks noted them again.
 
-`--auto` was checked the same way: fish and bash terminals with stand-in agents, a core stop and start, and each restored shell started its agent on its own session and folder; Ctrl+Shift+R afterwards found nothing to do, and quitting a resumed agent forgot its session. The zsh lines haven't run in a real zsh yet.
+`--auto` was checked the same way: fish and bash terminals with stand-in agents, a core stop and start, and each restored shell started its agent on its own session and folder; Ctrl+Shift+R afterwards found nothing to do, and quitting a resumed agent forgot its session. The zsh lines haven't run in a real zsh yet. Launch flags and failure reports were checked the same way: stand-ins started with `--model opus --dangerously-skip-permissions --append-system-prompt "be brief" "fix it"` and `-m gpt-5 -s workspace-write --full-auto` came back with every flag but the prompt and `--full-auto`, both through Ctrl+Shift+R and `--auto`; a session whose agent says "No conversation found" was reported in the pass's result and, with `--auto`, by the yellow line. Under fish, the resumed agent runs as its own foreground job (Herdr shows it, Ctrl+C hands the shell back).
 
 Also validated end to end against an isolated herdr-core session (`HC_SESSION=…`, its own app home): stand-in `claude`/`codex` programs that run the hook like the real ones, a core stop and start, then a pass. Covered: a resumed Claude and Codex session, a quit Codex session not coming back, a busy terminal skipped then resumed, a nested agent not noted. The real Claude Code 2.1.316 hook was checked the same way (noted on start, forgotten on `/exit`). Herdr app 0.1.10, herdr-core 0.1.15, Linux.
 

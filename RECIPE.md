@@ -9,19 +9,20 @@ Restarting the machine kills every agent. Herdr brings each terminal back as a b
 ## What you see
 
 - Nothing until you press Ctrl+Shift+R. Installed with `--auto`, a restored terminal shows one dim line, `agent-resume: claude --resume <id> in <folder>`, and the agent opens on its old conversation as soon as the shell is up, with no popup or toast.
-- Then a popup pill, 340×40 px, centered at the top of the window 44 px down: the theme's `popover` background, a 1 px `border` outline, 10 px corners, 14 px side padding. Inside, 10 px apart: a 12 px braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, 80 ms a frame) in `accent`, and 13 px `foreground` text, "Looking for agents to resume…", truncated with an ellipsis. It closes by itself when the pass ends, usually within a second.
+- Then a popup pill, 340×40 px, centered at the top of the window 44 px down: the theme's `popover` background, a 1 px `border` outline, 10 px corners, 14 px side padding. Inside, 10 px apart: a 12 px braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, 80 ms a frame) in `accent`, and 13 px `foreground` text, "Looking for agents to resume…", truncated with an ellipsis. It closes by itself when the pass ends: within a second when there's nothing to resume, about 5 s after typing when there is (it checks the agents came up).
 - In each terminal that gets its agent back, the shell shows the typed command, `cd '<folder>' && claude --resume <id>` (or `codex resume <id>`), and the agent opens on its old conversation, idle.
 - Then a toast, one line of body:
   - success, "Resumed 3 agents", body the terminals' `space / tab`, 5 s;
   - warning, "Resumed 2 of 3 agents", body "Not resumed: web / 2: something else is running there", 8 s;
-  - warning, "Couldn't resume 1 agent", body the reasons, 8 s;
+  - warning, "Couldn't resume 1 agent", body the reasons, 8 s (an agent that exited right away reads "exited right away: <its last line>");
   - info, "No agent to resume", body "No terminal lost its agent.", 3 s;
   - info, "Already resuming agents" for a second press while a pass runs;
   - error, "Couldn't resume agents" with the error.
 
 ## How it behaves
 
-- **Noting sessions.** A SessionStart hook for Claude Code and Codex runs `agent_resume.py hook claude|codex`. Inside a Herdr terminal (`HC_TERMINAL_ID` set), it sets the label `agent-resume` on that terminal to compact JSON: `agent`, `session`, `cwd`, `transcript`, `pid` (the agent), `shell` (the terminal's program), `boot` (Linux `boot_id`, macOS `kern.boottime`) and `at`.
+- **Noting sessions.** A SessionStart hook for Claude Code and Codex runs `agent_resume.py hook claude|codex`. Inside a Herdr terminal (`HC_TERMINAL_ID` set), it sets the label `agent-resume` on that terminal to compact JSON: `agent`, `session`, `cwd`, `transcript`, `args`, `pid` (the agent), `shell` (the terminal's program), `boot` (Linux `boot_id`, macOS `kern.boottime`) and `at`.
+  - `args` are the agent's launch flags worth keeping, read from `/proc/<pid>/cmdline` (Linux only) and filtered through `KEEP_FLAGS`: an allowlist per agent with each flag's number of values, limited to flags that agent's resume command accepts. Prompts, session pickers (`--resume`, `--continue`, `--session-id`), `-p`/`--print`, `--worktree` and unknown flags are dropped. A label read back is filtered again, so a label can never carry more.
   - Claude Code runs it on start, `/resume`, `/clear` and compact.
   - Codex runs it at the first turn of a session, not when it opens, so a Codex window nobody typed into isn't noted. There's nothing to resume in it anyway.
 - It doesn't note:
@@ -34,13 +35,15 @@ Restarting the machine kills every agent. Herdr brings each terminal back as a b
 - **A pass** (Ctrl+Shift+R, or `agent_resume.py resume`):
   - reads every live local terminal (`hc ls`, then `hc get` 8 at a time);
   - a labeled terminal lost its agent when its label is from another boot, or its program isn't the process the agent ran under;
-  - resumes, newest first, each lost one whose foreground is the terminal's own shell (fish, bash, zsh, sh, dash, ksh), typing the command with `hc send` 150 ms apart, after the shell has run at least 1.5 s;
+  - resumes, newest first, each lost one whose foreground is the terminal's own shell (fish, bash, zsh, sh, dash, ksh), typing the command with `hc send` 150 ms apart, after the shell has run at least 1.5 s. The command is the agent's resume words, then its `args`, each in single quotes unless plain; a flag with a value that can't go between single quotes is left out;
+  - 5 s after the last send, re-reads each: a terminal back at its shell whose label is still lost failed, reported as "exited right away: <the last line before the prompt>" (`hc read`);
   - waits up to 12 s, re-reading every 0.5 s, for restored shells that haven't started yet;
   - skips, with the reason in the toast: something else running there; its folder gone; its folder name not typable (a quote, a backslash, a control character); no saved conversation (the transcript doesn't exist); a session still open in another terminal or resumed once already in this pass (those two aren't shown).
 - **Automatic resume** (opt-in, `install.py --auto`). A marked block in the shell's startup (fish: `conf.d/agent-resume.fish`; bash: end of `.bashrc`; zsh: end of `.zshrc`) runs `agent_resume.py here` once, at the first prompt of an interactive shell with `HC_TERMINAL_ID` set and `AGENT_RESUME_AUTO` not `0`. It:
   - reads this terminal (`hc get`, 3 s), and goes on only if the shell is the terminal's own program and its label is lost (as in a pass), its folder exists and its transcript exists;
   - claims the session in `$XDG_RUNTIME_DIR/herdr-agent-resume-<uid>/claim-<agent>-<session>` (pid and start time), so two restored shells never open the same session;
-  - prints the dim line, `chdir`s to the session's folder and `exec`s the agent, so the agent is the shell's child as the hook expects and nothing is typed;
+  - prints the dim line, `chdir`s to the session's folder and starts the agent with its `args`, nothing typed. When the shell gave it its own process group (bash), it `exec`s the agent. When it shares the shell's (fish runs prompt events without job control), it forks the agent into a new process group, makes that the terminal's foreground (`tcsetpgrp`), waits, and hands the terminal back, so Herdr sees the agent in front; Ctrl+Z is resumed at once there, as there's no shell job to stop;
+  - exits with the agent's code. On a non-zero code other than 130/143, the block runs `agent_resume.py after <code>`: if the agent ran under 10 s and no hook noted the session, it prints one yellow line ("claude exited right away (code 1), so session … didn't come back. Ctrl+Shift+R tries again.") and logs `failed`;
   - otherwise does nothing and prints nothing, except one line when the agent can't be started.
   A pass skips, without saying so, a terminal whose foreground is already that agent or `agent_resume.py here`, or whose session is claimed by a live process ("resumed by its shell").
 - After a resumed agent starts, its hook notes it again with the new shell, so a second press does nothing.
@@ -72,7 +75,7 @@ Restarting the machine kills every agent. Herdr brings each terminal back as a b
 - `claude --resume` may continue under a new id; the hook follows it.
 - A folder Claude Code hasn't been told to trust stops at its trust prompt.
 - Labels live in herdr-core with the terminal, so removing a terminal (`hc rm`) or closing its pane forgets the session too.
-- Tested on Linux only (Herdr app 0.1.10, herdr-core 0.1.15, Claude Code 2.1.316, Codex 0.165.0, fish 4). The macOS code paths (`ps`, `sysctl`, polling instead of `pidfd`) haven't run.
+- Tested on Linux only (Herdr app 0.1.10, herdr-core 0.1.15, Claude Code 2.1.316, Codex 0.165.0, fish 4). The macOS code paths (`ps`, `sysctl`, polling instead of `pidfd`) haven't run, and launch flags aren't kept there (no `/proc`).
 
 ## Done when
 
