@@ -95,6 +95,8 @@ The full spec (what you see, how it behaves, how it's built) is in [RECIPE.md](R
 
 ## Development
 
+How to report a problem, try a change safely and open a pull request: [CONTRIBUTING.md](CONTRIBUTING.md). On macOS? A "Tried it on my machine" issue helps even when everything works.
+
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py'   # plan, process tree, hook guards, installer
 node --test tests/*.test.mjs                           # the toast text

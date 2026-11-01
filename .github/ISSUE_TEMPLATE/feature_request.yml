@@ -1,0 +1,18 @@
+name: Idea
+description: Suggest a change to Agent resume
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you're trying to do
+      description: The situation and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help
+      description: How you picture it working. Another agent or shell? Say how it resumes a session from the command line.
+    validations:
+      required: true

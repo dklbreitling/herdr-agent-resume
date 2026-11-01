@@ -1,0 +1,42 @@
+name: Tried it on my machine
+description: Report a run on macOS or another setup it hasn't been tested on, even if everything worked
+labels: [tested]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Agent resume has only run on Linux with fish and bash. A short report
+        from another setup tells everyone what works.
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: OS version, `herdr-app --version`, `hc --version`, shell, and `claude --version` / `codex --version`
+      placeholder: macOS 15.5, herdr-app 0.1.11, hc 0.1.16, zsh 5.9, Claude Code 2.1.316
+    validations:
+      required: true
+  - type: checkboxes
+    id: worked
+    attributes:
+      label: What worked
+      description: Tick what you checked and saw working.
+      options:
+        - label: Starting an agent in a Herdr terminal sets its `agent-resume` label (`hc get <terminal> --json`)
+        - label: Quitting the agent removes the label a few seconds later
+        - label: After `hc server stop` and `hc server start` (or a reboot), Ctrl+Shift+R brought the agents back
+        - label: With `--auto`, the restored terminals brought their agents back by themselves
+        - label: Pressing Ctrl+Shift+R again said "No agent to resume"
+  - type: textarea
+    id: notes
+    attributes:
+      label: What didn't, or anything odd
+      description: Include `agent_resume.py status` output or log lines if something went wrong.

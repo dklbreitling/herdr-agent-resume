@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    name: Toast tests (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node --test tests/*.test.mjs
+      - name: Syntax-check the popup
+        run: node --check mods/agent-resume/main.js
+
+  python:
+    name: Python tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -p 'test_*.py'
+      - name: The script starts and prints its usage
+        run: python mods/agent-resume/agent_resume.py help 2>&1 | grep -q "SessionStart hook"
+
+  shells:
+    name: Startup lines parse (fish, bash, zsh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq fish zsh
+      - name: Write and check each shell's lines
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          spec = importlib.util.spec_from_file_location("installer", "scripts/install.py")
+          installer = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(installer)
+          for shell in ("fish", "bash", "zsh"):
+              with open(f"/tmp/startup.{shell}", "w") as f:
+                  f.write(installer.snippet(shell, "/home/you/.config/herdr-app/mods/agent-resume/agent_resume.py"))
+          PY
+          fish -n /tmp/startup.fish
+          bash -n /tmp/startup.bash
+          zsh -n /tmp/startup.zsh
+      - name: Shells start cleanly with the lines and no Herdr terminal
+        run: |
+          fish -i -c 'source /tmp/startup.fish; echo fish ok'
+          bash --rcfile /tmp/startup.bash -i -c 'echo bash ok'
+          zsh -f -i -c 'source /tmp/startup.zsh; echo zsh ok'
+
+  files:
+    name: Mod files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: JSON files parse
+        run: |
+          for f in mods/agent-resume/mod.json keys.json package.json; do
+            python3 -m json.tool "$f" > /dev/null || { echo "::error file=$f::invalid JSON"; exit 1; }
+          done
+      - name: Installer copies every file the mod ships
+        run: |
+          python3 - <<'PY'
+          import importlib.util, pathlib, sys
+          spec = importlib.util.spec_from_file_location("installer", "scripts/install.py")
+          installer = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(installer)
+          shipped = {p.name for p in pathlib.Path("mods/agent-resume").iterdir()} - installer.GENERATED
+          listed = set(installer.FILES)
+          if shipped != listed:
+              print(f"::error file=scripts/install.py::FILES differs from mods/agent-resume: "
+                    f"missing {sorted(shipped - listed)}, extra {sorted(listed - shipped)}")
+              sys.exit(1)
+          PY
+      - name: Versions agree
+        run: |
+          python3 - <<'PY'
+          import json, re, sys
+          pkg = json.load(open("package.json"))["version"]
+          inst = re.search(r'^VERSION = "([^"]+)"', open("scripts/install.py").read(), re.M).group(1)
+          if pkg != inst:
+              print(f"::error::package.json is {pkg} but scripts/install.py is {inst}")
+              sys.exit(1)
+          PY
+      - name: Listing assets exist
+        run: test -f RECIPE.md && test -f preview.png

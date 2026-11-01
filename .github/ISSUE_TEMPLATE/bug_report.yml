@@ -1,0 +1,81 @@
+name: Bug report
+description: An agent didn't come back, came back wrong, or something got in the way
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please leave out conversation text and anything
+        private; mask folder names you'd rather not share.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead.
+      placeholder: |
+        1. Had Claude Code open in two terminals
+        2. Rebooted, opened Herdr, pressed Ctrl+Shift+R
+        3. Only one came back; the toast said ...
+    validations:
+      required: true
+  - type: dropdown
+    id: how
+    attributes:
+      label: How you resume
+      options:
+        - Ctrl+Shift+R
+        - Automatic (installed with --auto)
+    validations:
+      required: true
+  - type: input
+    id: herdr
+    attributes:
+      label: Herdr versions
+      description: Output of `herdr-app --version` and `hc --version`
+      placeholder: herdr-app 0.1.11, hc 0.1.16
+    validations:
+      required: true
+  - type: input
+    id: agents
+    attributes:
+      label: Agent versions
+      description: "`claude --version` and/or `codex --version`"
+      placeholder: Claude Code 2.1.316, codex 0.165.0
+    validations:
+      required: true
+  - type: input
+    id: mod
+    attributes:
+      label: Agent resume version or commit
+      description: The `version` in `~/.config/herdr-app/mods/agent-resume/.agent-resume-install.json`, or the commit you installed from
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+    validations:
+      required: true
+  - type: input
+    id: shell
+    attributes:
+      label: Shell
+      description: The shell your Herdr terminals run, with its version
+      placeholder: fish 4.0.2
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: What a pass would do
+      description: Output of `python3 ~/.config/herdr-app/mods/agent-resume/agent_resume.py status`
+      render: json
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The last lines of `~/.config/herdr-app/data/agent-resume/log.jsonl` around the problem
+      render: json
