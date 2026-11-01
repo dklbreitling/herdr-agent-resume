@@ -68,7 +68,7 @@ npm test                           # node toast tests + Python unit tests
 herdr-app check mods/agent-resume
 ```
 
-CI runs the tests on Node 22/24 and Python 3.9/3.13 (Linux and macOS),
+CI runs the tests on Node 22/24 and Python 3.10/3.13 on Linux, 3.9/3.13 on macOS,
 syntax-checks the fish, bash and zsh startup lines, and checks the JSON and
 file lists. It can't run Herdr or the agents, so say in the PR what you tried
 for real, on which OS, shell and versions.
