@@ -10,6 +10,9 @@ This brings Claude Code and Codex sessions back, the way the Herdr TUI did:
   resume              type `claude --resume <id>` / `codex resume <id>` into each
                       terminal that lost its agent and sits at a shell
   status              what `resume` would do, without typing anything
+  here                run by a shell as it starts (opt-in, see the installer's
+                      --auto): when this terminal lost its agent, start it again
+                      in place of typing anything
   adopt               note Claude Code sessions already running before the hook
                       was installed (from ~/.claude/sessions/<pid>.json)
   watch ...           internal: forget a session once its agent exits while the
@@ -45,6 +48,7 @@ HOOK_HC_TIMEOUT = 3  # the agent waits for its hook: never hold it up long
 LOG_LIMIT = 256 * 1024
 
 NOT_STARTED = "shell not started yet"
+BY_SHELL = "resumed by its shell"
 
 
 class HcError(Exception):
@@ -259,13 +263,17 @@ def log(event, **fields):
         pass
 
 
-def runtime_lock(name):
-    """An exclusive lock held until this process exits, or None if someone holds it."""
-    import fcntl
+def runtime_dir():
     base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
     folder = os.path.join(base, f"herdr-agent-resume-{os.getuid()}")
     os.makedirs(folder, mode=0o700, exist_ok=True)
-    fd = os.open(os.path.join(folder, name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    return folder
+
+
+def runtime_lock(name):
+    """An exclusive lock held until this process exits, or None if someone holds it."""
+    import fcntl
+    fd = os.open(os.path.join(runtime_dir(), name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -411,6 +419,15 @@ def at_shell(terminal):
     return bool(terminal.get("pid")) and fg.get("pid") == terminal.get("pid") and _names(fg.get("name") or "") & SHELLS
 
 
+def starting_agent(terminal, agent):
+    """True when the terminal's foreground is this agent, or `agent_resume.py here` about
+    to become it: the shell brought it back by itself."""
+    fg = terminal.get("foreground") or {}
+    argv = [a for a in (fg.get("argv") or [])[:3] if isinstance(a, str)]
+    names = _names(fg.get("name") or "", *argv)
+    return bool(names & AGENTS[agent]["names"]) or "agent_resume.py" in names
+
+
 def command(label):
     """What to type, or None when the folder can't be typed safely."""
     cwd = label.get("cwd")
@@ -444,7 +461,7 @@ def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile):
         elif not terminal.get("pid"):
             reason = NOT_STARTED
         elif not at_shell(terminal):
-            reason = "something else is running there"
+            reason = BY_SHELL if starting_agent(terminal, label["agent"]) else "something else is running there"
         elif not folder_ok(label.get("cwd")):
             reason = "its folder is gone"
         elif not file_ok(label.get("transcript")):
@@ -498,6 +515,9 @@ def resume(dry_run=False, wait=START_WAIT):
             time.sleep(SEND_GAP)
         try:
             terminal = hc_json(["get", item["terminal"]])
+            if claim_holder(item["agent"], item["session"]):
+                skipped.append({**item, "reason": BY_SHELL})
+                continue
             if not at_shell(terminal):
                 skipped.append({**item, "reason": "something else is running there"})
                 continue
@@ -513,6 +533,97 @@ def resume(dry_run=False, wait=START_WAIT):
     for item in skipped:
         log("skip", terminal=item["terminal"], agent=item["agent"], session=item["session"], reason=item["reason"])
     return {"resumed": resumed, "skipped": skipped}
+
+
+# ---------------------------------------------------------------- here (auto-resume)
+
+def _claim_path(agent, session):
+    return os.path.join(runtime_dir(), f"claim-{agent}-{session}")
+
+
+def _stamp(pid):
+    info = proc(pid)
+    return f"{pid} {info.get('start')}" if info else None
+
+
+def claim_holder(agent, session):
+    """The live process a shell started this session in (it exec'd into the agent), or None."""
+    try:
+        with open(_claim_path(agent, session)) as f:
+            saved = f.read().strip()
+        pid = int(saved.split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return pid if _stamp(pid) == saved else None
+
+
+def claim(agent, session):
+    """Mark the session as being resumed by this process (which becomes the agent).
+    False when another live agent already holds it."""
+    path = _claim_path(agent, session)
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if claim_holder(agent, session):
+                return False
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(_stamp(os.getpid()) or str(os.getpid()))
+        return True
+    return False
+
+
+def decide_here(terminal, shell_pid, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile):
+    """(label, None) when this shell should bring its terminal's agent back, else
+    (None, why not). Pure, like `plan`."""
+    if terminal.get("state") != "live" or terminal.get("pid") != shell_pid:
+        return None, "not the terminal's own shell"
+    label = read_label(terminal.get("labels"))
+    if not label:
+        return None, "no session noted"
+    if not lost(terminal, label, boot):
+        return None, "agent not lost"
+    if not folder_ok(label.get("cwd")):
+        return None, "its folder is gone"
+    if not file_ok(label.get("transcript")):
+        return None, "no saved conversation to resume"
+    return label, None
+
+
+def here(env=None, shell_pid=None):
+    """Called by a starting shell. Execs the agent when its terminal lost one; returns
+    why not otherwise."""
+    env = os.environ if env is None else env
+    term = env.get("HC_TERMINAL_ID")
+    if not term:
+        return "not in a Herdr terminal"
+    if env.get("AGENT_RESUME_AUTO") == "0":
+        return "turned off"
+    terminal = hc_json(["get", term], timeout=HOOK_HC_TIMEOUT)
+    label, why = decide_here(terminal, shell_pid or os.getppid(), boot_id())
+    if why:
+        return why
+    if not claim(label["agent"], label["session"]):
+        return "resumed in another terminal"
+    argv = AGENTS[label["agent"]]["argv"](label["session"])
+    where = (terminal.get("labels") or {}).get("where")
+    log("here", terminal=term, where=where, agent=label["agent"], session=label["session"])
+    sys.stderr.write(f"\033[2magent-resume: {' '.join(argv)} in {label['cwd']}\033[0m\n")
+    sys.stderr.flush()
+    try:
+        os.chdir(label["cwd"])
+        os.execvp(argv[0], argv)
+    except OSError as error:
+        try:
+            os.unlink(_claim_path(label["agent"], label["session"]))
+        except OSError:
+            pass
+        return f"couldn't start {argv[0]}: {error}"
 
 
 # ---------------------------------------------------------------- CLI
@@ -539,6 +650,15 @@ def main(argv):
             outcome = f"error: {error}"
         if outcome.startswith(("forgot", "error")):
             log("watch", terminal=term, outcome=outcome)
+        return 0
+    if command_name == "here":
+        try:
+            outcome = here()
+        except Exception as error:  # never break the shell starting up
+            outcome = f"error: {error}"
+        if outcome.startswith(("couldn't", "error")):
+            log("here", terminal=os.environ.get("HC_TERMINAL_ID"), outcome=outcome)
+            sys.stderr.write(f"agent-resume: {outcome}\n")
         return 0
     if command_name in ("resume", "status", "adopt"):
         try:

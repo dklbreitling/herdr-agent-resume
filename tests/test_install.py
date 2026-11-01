@@ -54,6 +54,50 @@ class HookTests(unittest.TestCase):
         self.assertEqual(installer.remove_hook(installer.add_hook({}, CMD)), {"hooks": {}})
 
 
+class ShellTests(unittest.TestCase):
+    SCRIPT = "/app/mods/agent-resume/agent_resume.py"
+
+    def test_block_is_added_once_and_removed_cleanly(self):
+        block = installer.snippet("bash", self.SCRIPT)
+        for original in ("", "alias ll='ls -l'\n", "export A=1"):
+            added = installer.with_block(original, block)
+            self.assertEqual(added.count(installer.BEGIN), 1)
+            self.assertEqual(installer.with_block(added, block), added)
+            self.assertEqual(installer.without_block(added), original if original.endswith("\n") or not original else original + "\n")
+
+    def test_an_older_block_is_replaced_in_place(self):
+        text = "a\n\n" + installer.snippet("zsh", "/old/agent_resume.py") + "b\n"
+        new = installer.with_block(text, installer.snippet("zsh", self.SCRIPT))
+        self.assertTrue(new.startswith("a\n\n" + installer.BEGIN))
+        self.assertTrue(new.endswith(installer.END + "\nb\n"))
+        self.assertNotIn("/old/", new)
+
+    def test_a_broken_block_changes_nothing(self):
+        with self.assertRaisesRegex(ValueError, "not their end"):
+            installer.without_block("x\n" + installer.BEGIN + "\nfoo\n")
+
+    def test_refuses_a_path_with_a_quote(self):
+        with self.assertRaises(ValueError):
+            installer.snippet("fish", "/it's/agent_resume.py")
+
+    def test_changes_per_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".config" / "fish").mkdir(parents=True)
+            (home / ".bashrc").write_text("export A=1\n")
+            self.assertEqual(installer.shell_changes(home, self.SCRIPT, "refresh"), [])
+            self.assertEqual(installer.shell_changes(home, self.SCRIPT, "remove"), [])
+            added = installer.shell_changes(home, self.SCRIPT, "add")
+            self.assertEqual([p.name for p, _ in added], ["agent-resume.fish", ".bashrc"])
+            installer.apply_shell(added)
+            self.assertIn("fish_prompt", (home / ".config/fish/conf.d/agent-resume.fish").read_text())
+            self.assertEqual(installer.shell_changes(home, self.SCRIPT, "add"), [])
+            self.assertEqual(len(installer.shell_changes(home, "/moved/agent_resume.py", "refresh")), 2)
+            installer.apply_shell(installer.shell_changes(home, self.SCRIPT, "remove"))
+            self.assertFalse((home / ".config/fish/conf.d/agent-resume.fish").exists())
+            self.assertEqual((home / ".bashrc").read_text(), "export A=1\n")
+
+
 class UpdateTests(unittest.TestCase):
     def test_update_refuses_edited_or_extra_files(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -2,7 +2,7 @@
 // The shipped toast shows the body on one truncated line: keep it short, most useful first.
 
 // Sessions open in another terminal are fine: nobody needs to hear about them.
-const QUIET = new Set(["open in another terminal", "resumed in another terminal"]);
+const QUIET = new Set(["open in another terminal", "resumed in another terminal", "resumed by its shell"]);
 
 const place = (item) => item.where || item.terminal;
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;

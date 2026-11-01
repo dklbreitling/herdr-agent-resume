@@ -121,6 +121,55 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(sorted(t["agent"] for t in todo), ["claude", "codex"])
 
 
+    def test_a_terminal_whose_shell_brought_the_agent_back(self):
+        for fg in ({"name": "claude"}, {"name": "node-MainThread", "argv": ["node", "/usr/bin/codex"]},
+                   {"name": "python3", "argv": ["python3", "/m/agent_resume.py", "here"]}):
+            agent = "codex" if "codex" in str(fg) else "claude"
+            term = terminal(lbl=label(agent=agent))
+            term["foreground"] = {"pid": 301, **fg}
+            _, skipped = run_plan([term])
+            self.assertEqual([s["reason"] for s in skipped], [ar.BY_SHELL], fg)
+
+
+class HereTests(unittest.TestCase):
+    def decide(self, term, shell=300, **checks):
+        return ar.decide_here(term, shell, BOOT, **{"folder_ok": lambda p: True, "file_ok": lambda p: True, **checks})
+
+    def test_brings_back_a_lost_agent(self):
+        found, why = self.decide(terminal(lbl=label(shell=100)))
+        self.assertIsNone(why)
+        self.assertEqual(found["session"], SID)
+        found, why = self.decide(terminal(lbl=label(shell=300, boot="old")))
+        self.assertIsNone(why)
+
+    def test_leaves_everything_else(self):
+        cases = [
+            (terminal(lbl=label(shell=100)), {"shell": 301}, "not the terminal's own shell"),  # a nested shell
+            (terminal(lbl=label(shell=100), state="finished"), {}, "not the terminal's own shell"),
+            (terminal(), {}, "no session noted"),
+            (terminal(lbl=label(shell=300)), {}, "agent not lost"),
+            (terminal(lbl=label(shell=100)), {"folder_ok": lambda p: False}, "its folder is gone"),
+            (terminal(lbl=label(shell=100)), {"file_ok": lambda p: False}, "no saved conversation to resume"),
+        ]
+        for term, extra, why in cases:
+            self.assertEqual(self.decide(term, **extra), (None, why))
+
+    def test_guards(self):
+        self.assertEqual(ar.here(env={}), "not in a Herdr terminal")
+        self.assertEqual(ar.here(env={"HC_TERMINAL_ID": "t1", "AGENT_RESUME_AUTO": "0"}), "turned off")
+
+    def test_claims_a_session_once(self):
+        with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}):
+            self.assertIsNone(ar.claim_holder("claude", SID))
+            self.assertTrue(ar.claim("claude", SID))
+            self.assertEqual(ar.claim_holder("claude", SID), os.getpid())
+            self.assertFalse(ar.claim("claude", SID))
+            self.assertTrue(ar.claim("codex", SID))
+            Path(ar._claim_path("claude", SID)).write_text("999999999 1")  # a gone process
+            self.assertIsNone(ar.claim_holder("claude", SID))
+            self.assertTrue(ar.claim("claude", SID))
+
+
 class ProcessTreeTests(unittest.TestCase):
     # 50 hook sh -> 40 claude -> 30 fish (the terminal) -> 20 herdr-core -> 1
     TREE = {50: (40, {"sh"}), 40: (30, {"claude"}), 30: (20, {"fish"}), 20: (1, {"herdr-core"}),

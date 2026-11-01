@@ -30,3 +30,8 @@ test("nothing to do", () => {
 test("a second press while a pass runs", () => {
   assert.equal(summary({ busy: true }).title, "Already resuming agents");
 });
+
+test("terminals whose shell brought the agent back aren't reported", () => {
+  const n = summary({ resumed: [], skipped: [item("t2", "claude", "web / 2", "resumed by its shell")] });
+  assert.equal(n.title, "No agent to resume");
+});

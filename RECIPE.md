@@ -8,7 +8,7 @@ Restarting the machine kills every agent. Herdr brings each terminal back as a b
 
 ## What you see
 
-- Nothing until you press Ctrl+Shift+R.
+- Nothing until you press Ctrl+Shift+R. Installed with `--auto`, a restored terminal shows one dim line, `agent-resume: claude --resume <id> in <folder>`, and the agent opens on its old conversation as soon as the shell is up, with no popup or toast.
 - Then a popup pill, 340×40 px, centered at the top of the window 44 px down: the theme's `popover` background, a 1 px `border` outline, 10 px corners, 14 px side padding. Inside, 10 px apart: a 12 px braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, 80 ms a frame) in `accent`, and 13 px `foreground` text, "Looking for agents to resume…", truncated with an ellipsis. It closes by itself when the pass ends, usually within a second.
 - In each terminal that gets its agent back, the shell shows the typed command, `cd '<folder>' && claude --resume <id>` (or `codex resume <id>`), and the agent opens on its old conversation, idle.
 - Then a toast, one line of body:
@@ -37,6 +37,12 @@ Restarting the machine kills every agent. Herdr brings each terminal back as a b
   - resumes, newest first, each lost one whose foreground is the terminal's own shell (fish, bash, zsh, sh, dash, ksh), typing the command with `hc send` 150 ms apart, after the shell has run at least 1.5 s;
   - waits up to 12 s, re-reading every 0.5 s, for restored shells that haven't started yet;
   - skips, with the reason in the toast: something else running there; its folder gone; its folder name not typable (a quote, a backslash, a control character); no saved conversation (the transcript doesn't exist); a session still open in another terminal or resumed once already in this pass (those two aren't shown).
+- **Automatic resume** (opt-in, `install.py --auto`). A marked block in the shell's startup (fish: `conf.d/agent-resume.fish`; bash: end of `.bashrc`; zsh: end of `.zshrc`) runs `agent_resume.py here` once, at the first prompt of an interactive shell with `HC_TERMINAL_ID` set and `AGENT_RESUME_AUTO` not `0`. It:
+  - reads this terminal (`hc get`, 3 s), and goes on only if the shell is the terminal's own program and its label is lost (as in a pass), its folder exists and its transcript exists;
+  - claims the session in `$XDG_RUNTIME_DIR/herdr-agent-resume-<uid>/claim-<agent>-<session>` (pid and start time), so two restored shells never open the same session;
+  - prints the dim line, `chdir`s to the session's folder and `exec`s the agent, so the agent is the shell's child as the hook expects and nothing is typed;
+  - otherwise does nothing and prints nothing, except one line when the agent can't be started.
+  A pass skips, without saying so, a terminal whose foreground is already that agent or `agent_resume.py here`, or whose session is claimed by a live process ("resumed by its shell").
 - After a resumed agent starts, its hook notes it again with the new shell, so a second press does nothing.
 - Only one pass runs at a time; a second press reports "Already resuming agents".
 
@@ -46,18 +52,18 @@ Restarting the machine kills every agent. Herdr brings each terminal back as a b
 - `keys.json`: `{"global": {"ctrl-shift-r": "mod.open:agent-resume"}}`.
 - `main.js`: the popup view. `init` runs `exec("python3", [appHome() + "/mods/agent-resume/agent_resume.py", "resume"])` in `cx.spawn`, parses the JSON, posts `notify(summary(out))` and always ends with `closeOverlay(props().overlay)`. `render` is an `h_flex` with a `div().frames(SPIN, 80)` spinner and a `truncate()` label. Herdr functions: `exec`, `appHome`, `theme`, `props`, `closeOverlay`, `notify`.
 - `summary.js`: the toast text, no `herdr` imports.
-- `agent_resume.py`: Python 3.8+, standard library only. Commands `hook`, `watch`, `resume`, `status` (a dry run), `adopt` (notes running Claude Code sessions from `~/.claude/sessions/<pid>.json`). It runs `hc` (`ls`, `get`, `label`, `send`), reads `/proc` (or `ps`, `sysctl`), and writes only `data/agent-resume/log.jsonl` (trimmed to 256 KiB) and lock files under `$XDG_RUNTIME_DIR`. It never reaches the network.
+- `agent_resume.py`: Python 3.8+, standard library only. Commands `hook`, `watch`, `resume`, `status` (a dry run), `here` (automatic resume), `adopt` (notes running Claude Code sessions from `~/.claude/sessions/<pid>.json`). It runs `hc` (`ls`, `get`, `label`, `send`), reads `/proc` (or `ps`, `sysctl`), and writes only `data/agent-resume/log.jsonl` (trimmed to 256 KiB) and lock files under `$XDG_RUNTIME_DIR`. It never reaches the network.
 - **Installing also needs the hooks.** Append one group to `SessionStart` in `~/.claude/settings.json` and in `~/.codex/hooks.json`, after the existing ones (Codex trusts hooks by position), backing both files up first:
 
   ```json
   { "hooks": [{ "type": "command", "command": "python3 '/home/you/.config/herdr-app/mods/agent-resume/agent_resume.py' hook claude", "timeout": 10 }] }
   ```
 
-  (`hook codex` in Codex's file.) `scripts/install.py` does all of it: copy, key, both hooks, `adopt`; `--update`, `--uninstall`, `--dry-run`.
+  (`hook codex` in Codex's file.) `scripts/install.py` does all of it: copy, key, both hooks, `adopt`; `--update`, `--uninstall`, `--dry-run`; `--auto` / `--no-auto` add or remove the shell startup block (backed up first; `--update` refreshes a block that's there).
 
 ## Watch out
 
-- **Nothing runs by itself.** The shipped layouts run no mod in the background; the person presses Ctrl+Shift+R after Herdr opens.
+- **The mod runs nothing by itself.** The shipped layouts run no mod in the background; the person presses Ctrl+Shift+R after Herdr opens, or installs with `--auto` so the shell does it.
 - Codex shows "Hooks need review" the next time it starts after install. Until the person trusts the hook, Codex sessions aren't noted.
 - `hc send` from inside a Herdr terminal wraps the text in `<hc from="tN">…</hc>` for agents. The pass drops `HC_TERMINAL_ID` and `HC_SCOPE` for its sends, so they're plain even when run from a terminal.
 - The `cd` matters. `claude --resume <id>` finds a session only from its project folder, and Codex works in whatever folder it's started in. A restored shell starts in the terminal's last folder, which isn't always the session's: the agent may have moved into a worktree, or the terminal was started elsewhere.
@@ -74,4 +80,5 @@ Restarting the machine kills every agent. Herdr brings each terminal back as a b
 - Starting `claude` in a Herdr terminal sets its `agent-resume` label; `/exit` removes it about 2 s later.
 - A Codex session's label appears after its first message.
 - `hc server stop`, then `hc server start` (run outside Herdr): each terminal comes back as a shell; Ctrl+Shift+R types the resume commands, the agents open on their conversations, and the toast reads "Resumed N agents". Pressing again says "No agent to resume".
+- With `--auto`: after the stop and start, each restored fish/bash/zsh shell starts its agent with no key press; Ctrl+Shift+R then says "No agent to resume"; `--no-auto` leaves the startup files as they were.
 - A session quit before the stop doesn't come back. A terminal running something else is skipped with that reason, and resumed on the next press once it's free.

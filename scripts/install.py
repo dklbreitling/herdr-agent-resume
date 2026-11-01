@@ -5,7 +5,9 @@
 - adds Ctrl+Shift+R (`mod.open:agent-resume`) to keys.json, refusing a key already in use;
 - appends a SessionStart hook to ~/.claude/settings.json and ~/.codex/hooks.json,
   next to the hooks already there (each file is backed up first);
-- notes Claude Code sessions that are already running (`agent_resume.py adopt`).
+- notes Claude Code sessions that are already running (`agent_resume.py adopt`);
+- with `--auto`, adds a few lines to fish, bash and zsh's startup files so a restored
+  terminal starts its agent again by itself (`--no-auto` takes them out).
 
 No layout change is needed. `--uninstall` takes all of it out again.
 """
@@ -22,11 +24,42 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parents[1]
 MOD_NAME = "agent-resume"
 PACKAGE = "herdr-agent-resume"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 MARKER = ".agent-resume-install.json"
 FILES = ("main.js", "summary.js", "mod.json", "agent_resume.py")
 GENERATED = {"gpui-kit.d.ts", "jsconfig.json", "__pycache__"}
 HOOK_TAG = "agent_resume.py' hook "
+BEGIN, END = "# >>> agent-resume >>>", "# <<< agent-resume <<<"
+ABOUT = ("# Agent resume (herdr-agent-resume): a restored Herdr terminal starts its agent again.\n"
+         "# Set AGENT_RESUME_AUTO=0 to pause it; `install.py --no-auto` removes these lines.\n")
+SNIPPETS = {
+    # After config.fish has run (PATH is set), at the first prompt.
+    "fish": """if status is-interactive; and set -q HC_TERMINAL_ID
+    function __agent_resume --on-event fish_prompt
+        functions -e __agent_resume
+        test "$AGENT_RESUME_AUTO" != 0; and test -f '{script}'; and command python3 '{script}' here
+    end
+end
+""",
+    "bash": """if [[ $- == *i* && -n "$HC_TERMINAL_ID" ]]; then
+    __agent_resume() {
+        PROMPT_COMMAND="${PROMPT_COMMAND/__agent_resume;/}"
+        unset -f __agent_resume
+        [[ "$AGENT_RESUME_AUTO" != 0 && -f '{script}' ]] && command python3 '{script}' here
+    }
+    PROMPT_COMMAND="__agent_resume;${PROMPT_COMMAND}"
+fi
+""",
+    "zsh": """if [[ -o interactive && -n "$HC_TERMINAL_ID" ]]; then
+    __agent_resume() {
+        add-zsh-hook -d precmd __agent_resume
+        unfunction __agent_resume
+        [[ "$AGENT_RESUME_AUTO" != 0 && -f '{script}' ]] && command python3 '{script}' here
+    }
+    autoload -Uz add-zsh-hook && add-zsh-hook precmd __agent_resume
+fi
+""",
+}
 
 
 def digest(path):
@@ -102,6 +135,93 @@ def remove_hook(config):
     return merged
 
 
+def snippet(shell, script):
+    if "'" in str(script):
+        raise ValueError(f"Can't write a startup line for a path with a quote: {script}")
+    body = SNIPPETS[shell].replace("{script}", str(script))
+    return f"{BEGIN}\n{ABOUT}{body}{END}\n"
+
+
+def without_block(text):
+    """`text` without our block (and the blank line we put before it)."""
+    start = text.find(BEGIN)
+    if start < 0:
+        return text
+    end = text.find(END, start)
+    if end < 0:
+        raise ValueError("Found the start of agent-resume's startup lines but not their end. No files changed.")
+    end += len(END)
+    if text[end:end + 1] == "\n":
+        end += 1
+    head = text[:start]
+    if head.endswith("\n\n"):
+        head = head[:-1]
+    return head + text[end:]
+
+
+def with_block(text, block):
+    """`text` with our block at the end (replacing an older one in place)."""
+    start = text.find(BEGIN)
+    if start >= 0:
+        rest = without_block(text[start:])
+        return text[:start] + block + rest
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + ("\n" if text else "") + block
+
+
+def shell_files(home):
+    """(shell, startup file) for each shell set up here. fish gets a file of its own."""
+    out = []
+    fish = home / ".config" / "fish"
+    if fish.is_dir():
+        out.append(("fish", fish / "conf.d" / "agent-resume.fish"))
+    if (home / ".bashrc").is_file():
+        out.append(("bash", home / ".bashrc"))
+    zdot = Path(os.environ["ZDOTDIR"]) if os.environ.get("ZDOTDIR") and home == Path.home().resolve() else home
+    if (zdot / ".zshrc").is_file():
+        out.append(("zsh", zdot / ".zshrc"))
+    return out
+
+
+def shell_changes(home, script, mode):
+    """(path, new text or None to delete) for the startup files. `mode`: "add", "remove",
+    or "refresh" (update lines already there, add none)."""
+    changes = []
+    for shell, path in shell_files(home):
+        old = path.read_text() if path.exists() else ""
+        if mode == "remove" or (mode == "refresh" and BEGIN not in old):
+            new = without_block(old)
+        else:
+            new = with_block(old, snippet(shell, script))
+        if new == old:
+            continue
+        if shell == "fish" and not new.strip():
+            new = None
+        changes.append((path, new))
+    return changes
+
+
+def write_text(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".agent-resume-", delete=False) as stream:
+        stream.write(text)
+        temp = Path(stream.name)
+    if path.exists():
+        os.chmod(temp, path.stat().st_mode & 0o777)
+    else:
+        os.chmod(temp, 0o644)
+    temp.replace(path)
+
+
+def apply_shell(changes):
+    for path, text in changes:
+        if text is None:
+            path.unlink(missing_ok=True)
+        else:
+            write_text(path, text)
+
+
 def verify_installed(destination, marker):
     if marker.get("package") != PACKAGE:
         raise ValueError("The existing mod belongs to another package")
@@ -136,6 +256,8 @@ def main():
     parser.add_argument("--update", action="store_true", help="update files previously installed by this script")
     parser.add_argument("--uninstall", action="store_true")
     parser.add_argument("--no-adopt", action="store_true", help="don't note Claude Code sessions already running")
+    parser.add_argument("--auto", action="store_true", help="restored terminals start their agent again by themselves (fish, bash, zsh)")
+    parser.add_argument("--no-auto", action="store_true", help="take the startup lines --auto added out again")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     app = args.app_home.expanduser().resolve()
@@ -147,6 +269,10 @@ def main():
     destination = app / "mods" / MOD_NAME
     script = destination / "agent_resume.py"
     configs = agent_configs(home)
+    if args.auto and args.no_auto:
+        raise ValueError("--auto and --no-auto can't go together")
+    mode = "remove" if args.uninstall or args.no_auto else "add" if args.auto else "refresh"
+    shells = shell_changes(home, script, mode)
 
     if args.uninstall:
         keys = remove_keys(json.loads(keys_path.read_text()), snippet)
@@ -166,6 +292,8 @@ def main():
     print(f"Mod: {destination}\nShortcut: Ctrl+Shift+R")
     for path, _ in changes:
         print(f"Hook: {path}")
+    for path, text in shells:
+        print(f"{'Startup lines removed' if text is None or BEGIN not in text else 'Startup lines'}: {path}")
     hooked = {name for name, _, _ in configs}
     if args.dry_run:
         print("Dry run: no files changed.")
@@ -178,6 +306,9 @@ def main():
     for name, path, _ in configs:
         if path.exists():
             shutil.copy2(path, backup / f"{name}-{path.name}")
+    for path, _ in shells:
+        if path.exists():
+            shutil.copy2(path, backup / f"shell-{path.name.lstrip('.')}")
     if destination.exists():
         shutil.copytree(destination, backup / MOD_NAME, ignore=shutil.ignore_patterns("__pycache__"))
 
@@ -185,6 +316,7 @@ def main():
         for path, config in changes:
             atomic_json(path, config)
         atomic_json(keys_path, keys)
+        apply_shell(shells)
         if destination.exists():
             shutil.rmtree(destination)
         print(f"Uninstalled. Backup: {backup}")
@@ -208,6 +340,7 @@ def main():
         atomic_json(keys_path, keys)
         for path, config in changes:
             atomic_json(path, config)
+        apply_shell(shells)
     except Exception:
         if replaced and destination.exists():
             shutil.rmtree(destination)
@@ -218,6 +351,12 @@ def main():
             saved = backup / f"{name}-{path.name}"
             if saved.exists():
                 shutil.copy2(saved, path)
+        for path, _ in shells:
+            saved = backup / f"shell-{path.name.lstrip('.')}"
+            if saved.exists():
+                shutil.copy2(saved, path)
+            else:
+                path.unlink(missing_ok=True)
         raise
     finally:
         if stage.exists():
@@ -237,6 +376,10 @@ def main():
     if "codex" in hooked and any(path.parent.name == ".codex" for path, _ in changes):
         print("Codex asks you to review the new hook the next time it starts: choose to trust it.")
     print("New Claude Code sessions pick up the hook when they start; running ones keep their old hooks.")
+    if any(text and BEGIN in text for _, text in shells):
+        print("Restored terminals now start their agent again by themselves; Ctrl+Shift+R still works for the rest.")
+    elif args.no_auto:
+        print("Restored terminals no longer start their agent by themselves; press Ctrl+Shift+R.")
 
 
 if __name__ == "__main__":
