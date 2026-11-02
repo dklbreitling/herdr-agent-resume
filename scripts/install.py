@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parents[1]
 MOD_NAME = "agent-resume"
 PACKAGE = "herdr-agent-resume"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 MARKER = ".agent-resume-install.json"
 FILES = ("main.js", "summary.js", "mod.json", "agent_resume.py")
 GENERATED = {"gpui-kit.d.ts", "jsconfig.json", "__pycache__"}

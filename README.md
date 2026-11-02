@@ -87,6 +87,7 @@ Three small pieces, all in `mods/agent-resume/agent_resume.py`:
 
 It skips, and says why:
 - a terminal running something else;
+- a terminal with incomplete or invalid saved session data (the other terminals still resume);
 - a session already open in another terminal (or resumed once already in this pass);
 - a folder that's gone, or one whose name can't be typed safely (a quote, a backslash, a control character);
 - a session with no saved conversation (an agent you never typed into).

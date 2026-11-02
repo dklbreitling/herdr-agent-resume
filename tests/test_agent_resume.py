@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import multiprocessing
 import os
 from io import StringIO
 from pathlib import Path
@@ -34,6 +35,23 @@ def run_plan(terminals, boot=BOOT, folder_ok=lambda p: True, file_ok=lambda p: T
     return ar.plan(terminals, boot, folder_ok=folder_ok, file_ok=file_ok)
 
 
+def paused_claim(runtime, ready, finish_write, finish_process, result):
+    """Hold a real claim writer before its PID is published, then keep it alive."""
+    original_stamp = ar._stamp
+
+    def stamp(pid):
+        if pid == os.getpid():
+            ready.set()
+            if not finish_write.wait(10):
+                raise RuntimeError("claim writer was not released")
+        return original_stamp(pid)
+
+    with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}), \
+         mock.patch.object(ar, "_stamp", side_effect=stamp):
+        result.send(ar.claim("claude", SID))
+        finish_process.wait(10)
+
+
 class LabelTests(unittest.TestCase):
     def test_reads_a_valid_label(self):
         self.assertEqual(ar.read_label({ar.LABEL: json.dumps(label())})["session"], SID)
@@ -44,6 +62,39 @@ class LabelTests(unittest.TestCase):
             self.assertIsNone(ar.read_label({ar.LABEL: raw}), raw)
         self.assertIsNone(ar.read_label({}))
         self.assertIsNone(ar.read_label(None))
+
+    def test_rejects_missing_or_invalid_fields(self):
+        bad_fields = {
+            "agent": [None, [], {}],
+            "session": [None, [], SID + "\n"],
+            "cwd": [None, "", 3, True, [], {}, "relative", "/bad\0path"],
+            "transcript": [None, "", 3, True, [], {}, "relative", "/bad\0path"],
+            "pid": [None, "200", 0, -1, True, [], {}],
+            "shell": [None, "100", 0, -1, True, [], {}],
+            "at": ["yesterday", -1, True, [], {}, float("nan"), float("inf")],
+            "boot": [1, True, [], {}],
+        }
+        for field, values in bad_fields.items():
+            if field not in ("at", "boot"):
+                missing = label()
+                del missing[field]
+                with self.subTest(field=field, missing=True):
+                    self.assertIsNone(ar.read_label({ar.LABEL: json.dumps(missing)}))
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.assertIsNone(ar.read_label({ar.LABEL: json.dumps({**label(), field: value})}))
+
+    def test_rejects_non_json_label_values(self):
+        for raw in (3, True, [], {"agent": "claude"}):
+            with self.subTest(raw=raw):
+                self.assertIsNone(ar.read_label({ar.LABEL: raw}))
+
+    def test_optional_metadata_and_quoted_paths_still_work(self):
+        saved = label(cwd="/it's/a\\folder")
+        del saved["at"]
+        del saved["boot"]
+        self.assertIsNotNone(ar.read_label({ar.LABEL: json.dumps(saved)}))
+        self.assertIsNotNone(ar.read_label({ar.LABEL: json.dumps({**saved, "at": None, "boot": None})}))
 
 
 class LostTests(unittest.TestCase):
@@ -183,6 +234,28 @@ class FailureTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
+    def test_bad_labels_are_reported_without_blocking_valid_terminals(self):
+        with tempfile.TemporaryDirectory() as folder:
+            transcript = Path(folder, "session.jsonl")
+            transcript.write_text("{}\n")
+            good = {**label(cwd=folder), "transcript": str(transcript)}
+            missing_cwd = dict(good)
+            del missing_cwd["cwd"]
+            broken = terminal("bad-json")
+            broken["labels"][ar.LABEL] = "{"
+            terms = [terminal("missing-cwd", lbl=missing_cwd),
+                     terminal("bad-date", lbl={**good, "at": "yesterday"}),
+                     terminal("bad-transcript", lbl={**good, "transcript": []}),
+                     broken, terminal("good", lbl=good)]
+            todo, skipped = ar.plan(terms, BOOT)
+        self.assertEqual([item["terminal"] for item in todo], ["good"])
+        self.assertEqual({item["terminal"] for item in skipped},
+                         {"missing-cwd", "bad-date", "bad-transcript", "bad-json"})
+        for item in skipped:
+            self.assertTrue(item["reason"].startswith("invalid session label:"), item)
+            self.assertIn("agent", item)  # resume's skip logger accepts every item
+            self.assertIn("session", item)
+
     def test_resumes_a_lost_agent_at_an_idle_shell(self):
         todo, skipped = run_plan([terminal(lbl=label(shell=100))])
         self.assertEqual(skipped, [])
@@ -258,6 +331,62 @@ class HereTests(unittest.TestCase):
         self.assertEqual(ar.here(env={}), "not in a Herdr terminal")
         self.assertEqual(ar.here(env={"HC_TERMINAL_ID": "t1", "AGENT_RESUME_AUTO": "0"}), "turned off")
 
+    def test_bad_label_is_reported_without_starting_an_agent(self):
+        bad = label()
+        del bad["cwd"]
+        env = {"HC_TERMINAL_ID": "t1"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(ar, "hc_json", return_value=terminal(lbl=bad)), \
+             mock.patch.object(ar.os, "getppid", return_value=300), \
+             mock.patch.object(ar, "claim") as claim, \
+             mock.patch.object(ar, "log") as log, \
+             mock.patch("sys.stderr", new_callable=StringIO) as err:
+            self.assertEqual(ar.main(["agent_resume.py", "here"]), 0)
+        claim.assert_not_called()
+        self.assertIn("invalid session label: cwd", err.getvalue())
+        log.assert_called_once()
+
+    def test_concurrent_claim_and_cleanup_cannot_steal_an_unwritten_claim(self):
+        ctx = multiprocessing.get_context("spawn")
+        for stale in (False, True):
+            with self.subTest(stale=stale), tempfile.TemporaryDirectory() as run, \
+                 mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}):
+                path = Path(ar._claim_path("claude", SID))
+                if stale:
+                    path.write_text("999999999 1")
+                ready, finish_write, finish_process = ctx.Event(), ctx.Event(), ctx.Event()
+                received, sent = ctx.Pipe(duplex=False)
+                writer = ctx.Process(target=paused_claim,
+                                     args=(run, ready, finish_write, finish_process, sent))
+                writer.start()
+                sent.close()
+                try:
+                    self.assertTrue(ready.wait(5), "writer never reached the claim file")
+                    # Custom ids may end in '.lock'; cleaning up a different
+                    # session must not remove this writer's guard file either.
+                    for session in (SID, SID + ".lock"):
+                        with mock.patch.object(ar, "hc_json", return_value=terminal(lbl=label(session=session))), \
+                             mock.patch.object(ar, "boot_id", return_value=BOOT), \
+                             mock.patch.object(ar, "log"):
+                            self.assertIsNone(ar.after("1", env={"HC_TERMINAL_ID": "t1"}))
+                        self.assertFalse(ar.claim("claude", SID))
+                    self.assertTrue(path.exists(), "cleanup removed the active writer's claim")
+                    finish_write.set()
+                    self.assertTrue(received.poll(5), "writer did not finish its claim")
+                    self.assertTrue(received.recv())
+                    self.assertEqual(ar.claim_holder("claude", SID), writer.pid)
+                    self.assertFalse(ar.claim("claude", SID))
+                finally:
+                    finish_write.set()
+                    finish_process.set()
+                    writer.join(5)
+                    if writer.is_alive():
+                        writer.terminate()
+                        writer.join(5)
+                    received.close()
+                self.assertEqual(writer.exitcode, 0)
+                self.assertTrue(ar.claim("claude", SID))  # stale ownership is reclaimable
+
     def test_claims_a_session_once(self):
         with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}):
             self.assertIsNone(ar.claim_holder("claude", SID))
@@ -267,6 +396,13 @@ class HereTests(unittest.TestCase):
             self.assertTrue(ar.claim("codex", SID))
             Path(ar._claim_path("claude", SID)).write_text("999999999 1")  # a gone process
             self.assertIsNone(ar.claim_holder("claude", SID))
+            self.assertTrue(ar.claim("claude", SID))
+
+    def test_failed_claim_write_releases_the_lock_for_retry(self):
+        with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}):
+            with mock.patch.object(ar, "_stamp", side_effect=OSError("cannot read process")):
+                with self.assertRaises(OSError):
+                    ar.claim("claude", SID)
             self.assertTrue(ar.claim("claude", SID))
 
 

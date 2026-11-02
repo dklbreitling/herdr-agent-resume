@@ -367,25 +367,50 @@ def hc_json(args, timeout=10):
 
 
 def valid_session(value):
-    return isinstance(value, str) and bool(SESSION_RE.match(value))
+    return isinstance(value, str) and bool(SESSION_RE.fullmatch(value))
 
 
-def read_label(labels):
-    """The saved session in a terminal's labels, or None."""
-    raw = (labels or {}).get(LABEL)
-    if not raw:
-        return None
+def parse_label(labels):
+    """(saved session, problem). Missing and unsupported legacy labels are quiet."""
+    raw = labels.get(LABEL) if isinstance(labels, dict) else None
+    if raw is None or raw == "":
+        return None, None
+    if not isinstance(raw, str):
+        return None, "invalid session label: expected JSON text"
     try:
         value = json.loads(raw)
     except ValueError:
-        return None
-    if not isinstance(value, dict) or value.get("agent") not in AGENTS or not valid_session(value.get("session")):
-        return None
+        return None, "invalid session label: malformed JSON"
+    if not isinstance(value, dict):
+        return None, "invalid session label: expected an object"
+    agent = value.get("agent")
+    if not isinstance(agent, str) or agent not in AGENTS:
+        return None, "invalid session label: unsupported agent"
+    if not valid_session(value.get("session")):
+        return None, "invalid session label: invalid session id"
+    if agent == "kiro" and not value["session"].startswith("sess_"):
+        return None, None  # Legacy V2 labels must not silently migrate a conversation.
+    for field in ("cwd", "transcript"):
+        path = value.get(field)
+        if not isinstance(path, str) or not os.path.isabs(path) or "\0" in path:
+            return None, f"invalid session label: {field} must be an absolute path"
+    for field in ("pid", "shell"):
+        pid = value.get(field)
+        if type(pid) is not int or pid <= 0:
+            return None, f"invalid session label: {field} must be a positive process id"
+    at = value.get("at")
+    if at is not None and (type(at) is not int or at < 0):
+        return None, "invalid session label: at must be a non-negative timestamp"
+    if value.get("boot") is not None and not isinstance(value["boot"], str):
+        return None, "invalid session label: boot must be text"
     raw_args = value.get("args")
-    value["args"] = flat(launch_flags(value["agent"], raw_args)) if isinstance(raw_args, list) else []
-    if value["agent"] == "kiro" and not value["session"].startswith("sess_"):
-        return None  # Legacy V2 labels must not silently migrate a conversation.
-    return value
+    value["args"] = flat(launch_flags(agent, raw_args)) if isinstance(raw_args, list) else []
+    return value, None
+
+
+def read_label(labels):
+    """The validated saved session in a terminal's labels, or None."""
+    return parse_label(labels)[0]
 
 
 # ---------------------------------------------------------------- log
@@ -684,15 +709,18 @@ def command(label):
 
 def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile):
     """Which terminals to resume. Pure: `terminals` are `hc get` records."""
-    entries = []
+    entries, skipped = [], []
     for terminal in terminals:
         if terminal.get("state") != "live":
             continue
-        label = read_label(terminal.get("labels"))
+        label, problem = parse_label(terminal.get("labels"))
+        if problem:
+            skipped.append({"terminal": terminal["address"], "where": terminal["labels"].get("where"),
+                            "agent": None, "session": None, "cwd": None, "reason": problem})
         if label:
             entries.append((terminal, label, lost(terminal, label, boot)))
     still_open = {(label["agent"], label["session"]) for _, label, gone in entries if not gone}
-    todo, skipped, taken = [], [], set()
+    todo, taken = [], set()
     for terminal, label, gone in sorted(entries, key=lambda e: -(e[1].get("at") or 0)):
         if not gone:
             continue
@@ -839,23 +867,26 @@ def claim_holder(agent, session):
 
 def claim(agent, session):
     """Mark the session as being resumed by this process (which becomes the agent).
-    False when another live agent already holds it."""
-    path = _claim_path(agent, session)
-    for _ in range(2):
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            if claim_holder(agent, session):
-                return False
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-            continue
+    False when another writer or live agent already holds it."""
+    # Separate names: a session ending in '.lock' must not be another claim's lock.
+    lock = runtime_lock(f"claim-guard-{agent}-{session}")
+    if lock is None:
+        return False
+    try:
+        path = _claim_path(agent, session)
+        if claim_holder(agent, session):
+            return False
+        # Checking stale ownership and publishing a new owner share one lock.
+        # An empty file while this writer starts is never treated as a stale claim.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
-            f.write(_stamp(os.getpid()) or str(os.getpid()))
+            stamp = _stamp(os.getpid())
+            if stamp is None:
+                return False
+            f.write(stamp)
         return True
-    return False
+    finally:
+        os.close(lock)
 
 
 def decide_here(terminal, shell_pid, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile):
@@ -863,7 +894,9 @@ def decide_here(terminal, shell_pid, boot, folder_ok=os.path.isdir, file_ok=os.p
     (None, why not). Pure, like `plan`."""
     if terminal.get("state") != "live" or terminal.get("pid") != shell_pid:
         return None, "not the terminal's own shell"
-    label = read_label(terminal.get("labels"))
+    label, problem = parse_label(terminal.get("labels"))
+    if problem:
+        return None, problem
     if not label:
         return None, "no session noted"
     if not lost(terminal, label, boot):
@@ -1031,10 +1064,8 @@ def here(env=None, shell_pid=None):
         os.chdir(label["cwd"])
         os.execvp(argv[0], argv)
     except OSError as error:
-        try:
-            os.unlink(_claim_path(label["agent"], label["session"]))
-        except OSError:
-            pass
+        # This process is about to exit; its stale claim can be reclaimed under
+        # the claim lock. Do not unlink a claim another process could replace.
         return f"couldn't start {argv[0]}: {error}"
 
 
@@ -1050,17 +1081,19 @@ def after(code, env=None):
     label = read_label(terminal.get("labels"))
     if not label or not lost(terminal, label, boot_id()):
         return None
-    path = _claim_path(label["agent"], label["session"])
+    lock = runtime_lock(f"claim-guard-{label['agent']}-{label['session']}")
+    if lock is None:
+        return None  # A new owner is publishing its claim.
     try:
+        path = _claim_path(label["agent"], label["session"])
         ran = time.time() - os.path.getmtime(path)
-    except OSError:
-        return None
-    if claim_holder(label["agent"], label["session"]):
-        return None
-    try:
+        if claim_holder(label["agent"], label["session"]):
+            return None
         os.unlink(path)
     except OSError:
-        pass
+        return None
+    finally:
+        os.close(lock)
     if ran > QUICK_EXIT:
         return None
     log("failed", terminal=term, agent=label["agent"], session=label["session"], code=code)
@@ -1112,7 +1145,7 @@ def main(argv):
             outcome = f"error: {error}"
         if isinstance(outcome, int):
             return outcome  # the agent ran as a job: its exit code, for `after`
-        if outcome.startswith(("couldn't", "error")):
+        if outcome.startswith(("couldn't", "error", "invalid session label:")):
             log("here", terminal=os.environ.get("HC_TERMINAL_ID"), outcome=outcome)
             sys.stderr.write(f"agent-resume: {outcome}\n")
         return 0
