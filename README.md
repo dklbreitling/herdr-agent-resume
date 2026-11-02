@@ -1,5 +1,12 @@
 # herdr-agent-resume
 
+[![Claude Code](https://img.shields.io/badge/Claude_Code-D97757?style=flat-square)](#install)
+[![Codex](https://img.shields.io/badge/Codex-111827?style=flat-square)](#install)
+[![Grok](https://img.shields.io/badge/Grok-18181B?style=flat-square)](#install)
+[![Antigravity CLI](https://img.shields.io/badge/Antigravity_CLI-4285F4?style=flat-square)](#install)
+[![Pi CLI](https://img.shields.io/badge/Pi_CLI-475569?style=flat-square)](#install)
+[![Kiro CLI V3](https://img.shields.io/badge/Kiro_CLI_V3-7C3AED?style=flat-square)](#install)
+
 **Bring coding-agent sessions back after a reboot, in the [Herdr](https://herdr.dev) desktop app.**
 
 When the machine restarts (or you log out, or herdr-core restarts), Herdr brings every tab and split back, but each terminal comes back as a bare shell in its last folder: the agent that was running there is gone. The Herdr TUI used to resume agents on restore. The app doesn't, by design ([herdr-core#13](https://github.com/herdrdev/herdr-core/issues/13)).
