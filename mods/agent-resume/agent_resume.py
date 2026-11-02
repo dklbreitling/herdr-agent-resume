@@ -3,18 +3,19 @@
 
 herdr-core brings a terminal that lost its program (reboot, logout, a core
 restart) back as a shell in its last folder, but never runs the program again.
-This brings Claude Code and Codex sessions back, the way the Herdr TUI did:
+This brings agent sessions back, the way the Herdr TUI did:
 
-  hook claude|codex   SessionStart hook: note the session on its terminal
-                      (an `agent-resume` label kept by herdr-core)
-  resume              type `claude --resume <id>` / `codex resume <id>` into each
-                      terminal that lost its agent and sits at a shell
+  hook <agent>        note the session on its terminal (an `agent-resume` label
+                      kept by herdr-core). Agents: claude, codex, grok, agy, pi, kiro
+  resume              type that agent's resume command into each terminal that
+                      lost its agent and sits at a shell
   status              what `resume` would do, without typing anything
   here                run by a shell as it starts (opt-in, see the installer's
                       --auto): when this terminal lost its agent, start it again
                       in place of typing anything
   after CODE          run by the same shell when that agent exits with CODE:
                       says so when it didn't come back (exited right away)
+  launch-kiro <id>    internal: supervise a resumed V3 job before its first hook
   adopt               note Claude Code sessions already running before the hook
                       was installed (from ~/.claude/sessions/<pid>.json)
   watch ...           internal: forget a session once its agent exits while the
@@ -22,6 +23,8 @@ This brings Claude Code and Codex sessions back, the way the Herdr TUI did:
 
 Standard library only (Python 3.8+). `resume` and `status` print JSON.
 """
+import glob
+import hashlib
 import json
 import os
 import re
@@ -30,11 +33,17 @@ import shutil
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 
 LABEL = "agent-resume"
 AGENTS = {
     "claude": {"names": {"claude"}, "argv": lambda session: ["claude", "--resume", session]},
     "codex": {"names": {"codex"}, "argv": lambda session: ["codex", "resume", session]},
+    "grok": {"names": {"grok"}, "argv": lambda session: ["grok", "--resume", session]},
+    "agy": {"names": {"agy"}, "argv": lambda session: ["agy", "--conversation", session]},
+    "pi": {"names": {"pi"}, "argv": lambda session: ["pi", "--session", session]},
+    "kiro": {"names": {"kiro", "kiro-cli", "kiro-cli-chat"},
+             "argv": lambda session: ["kiro-cli", "chat", "--v3", "--resume-id", session]},
 }
 # Launch flags carried over to the resume command, with how many values each takes
 # ("+": one or more, up to the next flag). Only flags that set up how the agent runs
@@ -58,12 +67,43 @@ KEEP_FLAGS = {
         "-a": 1, "--ask-for-approval": 1, "--add-dir": 1, "--enable": 1, "--disable": 1,
         "--local-provider": 1,
     },
+    "grok": {
+        "--always-approve": 0, "--debug": 0, "--disable-web-search": 0, "--fullscreen": 0,
+        "--minimal": 0, "--no-alt-screen": 0, "--no-plan": 0, "--no-subagents": 0, "--verbatim": 0,
+        "--add-dir": "+", "--allow": "+", "--deny": "+",
+        "--agent": 1, "--agents": 1, "--debug-file": 1, "--disallowed-tools": 1,
+        "-m": 1, "--model": 1, "--permission-mode": 1, "--reasoning-effort": 1, "--effort": 1,
+        "--rules": 1, "--sandbox": 1, "--system-prompt-override": 1, "--tools": 1, "--cwd": 1,
+    },
+    "agy": {
+        "--dangerously-skip-permissions": 0, "--disable-slash-commands": 0, "--sandbox": 0,
+        "--remote-control": 0,
+        "--add-dir": "+",
+        "--agent": 1, "--effort": 1, "--log-file": 1, "--mode": 1, "--model": 1,
+        "--project": 1, "--settings": 1,
+    },
+    "pi": {
+        "--no-extensions": 0, "-ne": 0, "--no-mcp": 0, "--no-skills": 0, "-ns": 0,
+        "--no-prompt-templates": 0, "-np": 0, "--no-themes": 0, "--no-context-files": 0, "-nc": 0,
+        "--no-tools": 0, "-nt": 0, "--no-builtin-tools": 0, "-nbt": 0,
+        "--approve": 0, "-a": 0, "--no-approve": 0, "-na": 0, "--offline": 0, "--verbose": 0,
+        "--provider": 1, "--model": 1, "--system-prompt": 1, "--thinking": 1, "--use-theme": 1,
+        "--tools": 1, "-t": 1, "--exclude-tools": 1, "-xt": 1, "--models": 1, "--tui-mode": 1,
+        "--session-dir": 1, "--name": 1, "-n": 1,
+        "--append-system-prompt": "+", "--extension": "+", "-e": "+", "--skill": "+",
+        "--prompt-template": "+", "--theme": "+",
+    },
+    "kiro": {
+        "--trust-all-tools": 0, "-a": 0,
+        "--agent": 1, "--model": 1, "--effort": 1, "--trust-tools": 1, "--mode": 1,
+    },
 }
 MAX_ARGS = 64
 MAX_ARG_LEN = 1024
 AGENT_NAMES = set().union(*(a["names"] for a in AGENTS.values()))
 SHELLS = {"fish", "bash", "zsh", "sh", "dash", "ksh", "mksh"}
-SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,127}$")
+# 8–128 characters. Pi custom ids may contain "_" and "."; Kiro V3 ids look like sess_<uuid>.
+SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
 # Typed into a shell between single quotes: no quotes, backslashes or control characters.
 TYPABLE_PATH_RE = re.compile(r"^/[^'\\\x00-\x1f\x7f]*$")
 TYPABLE_ARG_RE = re.compile(r"^[^'\\\x00-\x1f\x7f]*$")
@@ -152,6 +192,26 @@ def find_agent(agent, pid, lookup=proc):
             return pid
         pid = info["ppid"]
     return None
+
+
+def kiro_launcher(pid, lookup=proc):
+    """Collapse helper/runtime processes to the nearest Kiro CLI launcher.
+
+    A shell, another agent or a second launcher is a boundary, not a wrapper.
+    A tool-launched Kiro must never become its parent's session.
+    """
+    original = pid
+    for _ in range(64):
+        info = lookup(pid) if pid and pid > 1 else None
+        if not info:
+            break
+        names = info["names"]
+        if names & {"kiro", "kiro-cli"}:
+            return pid
+        if not names & {"kiro-cli-chat", "bun", "node"} or names & (AGENT_NAMES - AGENTS["kiro"]["names"]):
+            break
+        pid = info["ppid"]
+    return original
 
 
 def placement(agent_pid, shell_pid, lookup=proc):
@@ -323,6 +383,8 @@ def read_label(labels):
         return None
     raw_args = value.get("args")
     value["args"] = flat(launch_flags(value["agent"], raw_args)) if isinstance(raw_args, list) else []
+    if value["agent"] == "kiro" and not value["session"].startswith("sess_"):
+        return None  # Legacy V2 labels must not silently migrate a conversation.
     return value
 
 
@@ -371,6 +433,57 @@ def runtime_lock(name):
 
 # ---------------------------------------------------------------- hook
 
+def _text(data, *keys):
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _event_key(value):
+    return re.sub(r"[\s_-]", "", str(value or "")).lower()
+
+
+def is_session_event(agent, data):
+    """True for the events that mean "this session is the one in this terminal".
+
+    Kiro V3 also reports UserPromptSubmit after switching conversations.
+    Antigravity's SessionStart fires for a
+    new conversation; PreInvocation fires on every model call, including a resumed one."""
+    raw = data.get("hook_event_name") or data.get("hookEventName")
+    if not raw:
+        return True
+    key = _event_key(raw)
+    if key == "sessionstart":
+        return True
+    if agent == "agy" and key == "preinvocation":
+        return True
+    return agent == "kiro" and key == "userpromptsubmit"
+
+
+def default_transcript(agent, session, cwd, home=None):
+    """Where this agent stores the conversation, when the hook didn't say."""
+    home = home or os.path.expanduser("~")
+    if agent == "grok" and isinstance(cwd, str) and cwd:
+        return os.path.join(home, ".grok", "sessions", quote(cwd, safe=""), session, "updates.jsonl")
+    if agent == "agy":
+        return os.path.join(home, ".gemini", "antigravity-cli", "brain", session,
+                            ".system_generated", "logs", "transcript.jsonl")
+    if agent == "kiro":
+        # V3 persists metadata even before the first message. Existing sessions
+        # may have multiple workspace roots: find their actual bucket first.
+        root = os.path.join(home, ".kiro", "sessions")
+        found = glob.glob(os.path.join(root, "*", glob.escape(session), "session.json"))
+        if len(found) == 1:
+            return found[0]
+        if found or not isinstance(cwd, str) or not os.path.isabs(cwd):
+            return None
+        bucket = hashlib.sha256(os.path.normpath(cwd.replace("\\", "/")).encode("utf-8")).hexdigest()[:16]
+        return os.path.join(root, bucket, session, "session.json")
+    return None
+
+
 def hook(agent, raw, env=None):
     """SessionStart: note the session on this terminal. Returns what it did, for the log."""
     env = os.environ if env is None else env
@@ -383,48 +496,72 @@ def hook(agent, raw, env=None):
         return "input is not JSON"
     if not isinstance(data, dict):
         return "input is not an object"
-    if (data.get("hook_event_name") or "SessionStart") != "SessionStart":
+    if not is_session_event(agent, data):
         return "not SessionStart"
-    if data.get("agent_id"):
+    if data.get("agent_id") or data.get("agentId") or _text(data, "subagentType", "subagent_type"):
         return "subagent"
-    session = data.get("session_id")
+    if agent == "agy":
+        session = _text(data, "conversationId", "conversation_id", "session_id", "sessionId")
+        paths = data.get("workspacePaths") if isinstance(data.get("workspacePaths"), list) else []
+        cwd = paths[0] if paths and isinstance(paths[0], str) else _text(data, "cwd")
+    else:
+        session = _text(data, "session_id", "sessionId")
+        if agent == "grok":
+            session = session or (env.get("GROK_SESSION_ID") if isinstance(env.get("GROK_SESSION_ID"), str) else None)
+        cwd = _text(data, "cwd")
     if not valid_session(session):
         return "no usable session id"
+    if agent == "kiro" and not session.startswith("sess_"):
+        return "Kiro V2 is not supported"
     if agent == "codex" and env.get("CODEX_THREAD_ID") not in (None, "", session):
         return "codex sub-thread"
-    transcript = data.get("transcript_path")
+    if isinstance(cwd, str) and cwd.startswith("~"):
+        cwd = os.path.expanduser(cwd)
+    if not isinstance(cwd, str) or not cwd:
+        cwd = os.getcwd()
+    transcript = _text(data, "transcript_path", "transcriptPath")
+    if isinstance(transcript, str) and transcript.startswith("~"):
+        transcript = os.path.expanduser(transcript)
+    if not transcript:
+        transcript = default_transcript(agent, session, cwd)
     if not isinstance(transcript, str) or not transcript:
         return "no transcript: the session can't be resumed"
-    cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and data.get("cwd") else os.getcwd()
 
     agent_pid = find_agent(agent, os.getppid())
     if agent_pid is None and agent == "claude" and str(env.get("CLAUDE_PID", "")).isdigit():
         agent_pid = int(env["CLAUDE_PID"])
-    if not agent_pid:
-        return "agent process not found"
     terminal = hc_json(["get", term], timeout=HOOK_HC_TIMEOUT)
     shell = terminal.get("pid")
     if terminal.get("state") != "live" or not shell:
         return "terminal not live"
+    if not agent_pid:
+        return "agent process not found"
+    if agent == "kiro":
+        agent_pid = kiro_launcher(agent_pid)
     where = placement(agent_pid, shell)
     if where != "direct":
         return f"agent runs {where}"
+    label = read_label(terminal.get("labels"))
+    if (label and label.get("agent") == agent and label.get("session") == session
+            and label.get("pid") == agent_pid and label.get("shell") == shell):
+        return "already noted"
 
     remember(term, agent, session, cwd, transcript, agent_pid, shell)
     return "saved"
 
 
-def remember(term, agent, session, cwd, transcript, agent_pid, shell):
+def remember(term, agent, session, cwd, transcript, agent_pid, shell, watcher=True, launch_args=None):
     """Label the terminal with the session (and the agent's launch flags) and start its watcher."""
     label = {"agent": agent, "session": session, "cwd": cwd, "transcript": transcript,
              "pid": agent_pid, "shell": shell, "boot": boot_id(), "at": int(time.time() * 1000)}
-    argv = proc_argv(agent_pid)
-    if argv:
-        label["args"] = flat(launch_flags(agent, argv[1:]))
+    argv = proc_argv(agent_pid) if launch_args is None else None
+    if launch_args is not None or argv:
+        label["args"] = flat(launch_flags(agent, launch_args if launch_args is not None else argv[1:]))
     hc(["label", term, f"{LABEL}={json.dumps(label, separators=(',', ':'), ensure_ascii=False)}"], timeout=HOOK_HC_TIMEOUT)
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "watch", term, str(agent_pid), str(shell)],
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     close_fds=True, start_new_session=True)
+    if watcher:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "watch", term, str(agent_pid), str(shell)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         close_fds=True, start_new_session=True)
 
 
 def claude_session_of(pid, home=None):
@@ -439,7 +576,6 @@ def claude_session_of(pid, home=None):
     session, cwd = info.get("sessionId"), info.get("cwd")
     if info.get("pid") != pid or info.get("kind") not in (None, "interactive") or not valid_session(session):
         return None
-    import glob
     found = glob.glob(os.path.join(home, ".claude", "projects", "*", f"{session}.jsonl"))
     if not found or not isinstance(cwd, str):
         return None
@@ -537,6 +673,12 @@ def command(label):
     cwd = label.get("cwd")
     if not isinstance(cwd, str) or not TYPABLE_PATH_RE.match(cwd):
         return None
+    if label["agent"] == "kiro":
+        script = os.path.abspath(__file__)
+        if not TYPABLE_PATH_RE.match(script) or not TYPABLE_PATH_RE.match(sys.executable):
+            return None
+        return f"cd '{cwd}' && " + " ".join(_quote(a) for a in
+            [sys.executable, script, "launch-kiro", label["session"]])
     return f"cd '{cwd}' && " + " ".join(_quote(a) for a in resume_argv(label, typable_only=True))
 
 
@@ -747,7 +889,7 @@ def _default_signals():
             signal.signal(getattr(signal, name), signal.SIG_DFL)
 
 
-def run_as_job(argv, cwd):
+def run_as_job(argv, cwd, started=None):
     """Run the agent as the terminal's foreground job and wait for it. For shells that
     run startup code without job control (fish does, from its prompt event): there the
     agent would share the shell's process group, so Herdr would see the shell in front
@@ -778,6 +920,11 @@ def run_as_job(argv, cwd):
         os.tcsetpgrp(tty, pid)
     except OSError:
         pass
+    if started:
+        try:
+            started(pid)
+        except Exception as error:
+            log("launch", outcome=f"couldn't note the child: {error}")
     while True:
         _, status = os.waitpid(pid, os.WUNTRACED)
         if os.WIFSTOPPED(status):  # Ctrl+Z: there's no shell job to park it in, so go on
@@ -804,6 +951,57 @@ def needs_own_job():
         return False
 
 
+def kiro_finished(term, original, shell, pid, code, elapsed):
+    """Forget a completed Kiro job, or retain its old label for a failed-start retry.
+
+    The wrapper owns this child even when Kiro defers hooks until the first prompt.
+    A stopped core kills the wrapper too, leaving the persisted label for next boot.
+    """
+    terminal = hc_json(["get", term])
+    current = read_label(terminal.get("labels"))
+    if terminal.get("pid") != shell or not current or current.get("pid") != pid:
+        return
+    if code not in (0, 130, 143) and elapsed < QUICK_EXIT and current["session"] == original["session"]:
+        value = json.dumps(original, separators=(',', ':'))
+    else:
+        value = ""
+    hc(["label", term, f"{LABEL}={value}"])
+
+
+def run_kiro(term, label, shell):
+    child = []
+    began = time.monotonic()
+
+    def started(pid):
+        child.append(pid)
+        remember(term, "kiro", label["session"], label["cwd"], label["transcript"], pid, shell,
+                 watcher=False, launch_args=label.get("args", []))
+
+    code = run_as_job(resume_argv(label), label["cwd"], started=started)
+    try:
+        if child:
+            kiro_finished(term, label, shell, child[0], code, time.monotonic() - began)
+    except HcError as error:
+        log("launch", terminal=term, outcome=str(error))
+    return code
+
+
+def launch_kiro(session, env=None):
+    env = os.environ if env is None else env
+    term = env.get("HC_TERMINAL_ID")
+    if not term:
+        return 1
+    terminal = hc_json(["get", term])
+    label = read_label(terminal.get("labels"))
+    shell = terminal.get("pid")
+    if (not label or label["agent"] != "kiro" or label["session"] != session
+            or placement(os.getpid(), shell) != "direct"):
+        return 1
+    if not claim("kiro", session):
+        return 1
+    return run_kiro(term, label, shell)
+
+
 def here(env=None, shell_pid=None):
     """Called by a starting shell. Starts the agent when its terminal lost one and
     returns its exit code; returns why not otherwise."""
@@ -825,6 +1023,8 @@ def here(env=None, shell_pid=None):
     sys.stderr.write(f"\033[2magent-resume: {' '.join(_quote(a) for a in argv)} in {label['cwd']}\033[0m\n")
     sys.stderr.flush()
     try:
+        if label["agent"] == "kiro":
+            return run_kiro(term, label, terminal["pid"])
         if needs_own_job():
             return run_as_job(argv, label["cwd"])
         _default_signals()
@@ -872,17 +1072,29 @@ def after(code, env=None):
 
 def main(argv):
     command_name = argv[1] if len(argv) > 1 else "status"
+    if command_name == "launch-kiro":
+        try:
+            return launch_kiro(argv[2] if len(argv) > 2 else "")
+        except (HcError, OSError) as error:
+            log("launch", outcome=str(error))
+            return 1
     if command_name == "hook":
         agent = argv[2] if len(argv) > 2 else ""
         raw = sys.stdin.read()
-        if agent not in AGENTS:
-            return 0
-        try:
-            outcome = hook(agent, raw)
-        except Exception as error:  # a hook must never get in the agent's way
-            outcome = f"error: {error}"
-        if outcome != "not in a Herdr terminal":
-            log("hook", agent=agent, terminal=os.environ.get("HC_TERMINAL_ID"), outcome=outcome)
+        outcome = "ignored"
+        if agent in AGENTS:
+            try:
+                outcome = hook(agent, raw)
+            except Exception as error:  # a hook must never get in the agent's way
+                outcome = f"error: {error}"
+            if outcome != "not in a Herdr terminal":
+                log("hook", agent=agent, terminal=os.environ.get("HC_TERMINAL_ID"), outcome=outcome)
+        # Antigravity reads stdout as JSON. Pi's extension reads this one line and
+        # shows it to nobody. Every other agent would treat stdout as context, so stay quiet.
+        if agent == "agy":
+            sys.stdout.write("{}\n")
+        elif agent == "pi":
+            sys.stdout.write(outcome + "\n")
         return 0
     if command_name == "watch":
         term, agent_pid, shell = argv[2], int(argv[3]), int(argv[4])

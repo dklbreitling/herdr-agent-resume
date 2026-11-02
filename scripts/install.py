@@ -3,8 +3,11 @@
 
 - copies mods/agent-resume into the Herdr app's mods folder;
 - adds Ctrl+Shift+R (`mod.open:agent-resume`) to keys.json, refusing a key already in use;
-- appends a SessionStart hook to ~/.claude/settings.json and ~/.codex/hooks.json,
-  next to the hooks already there (each file is backed up first);
+- appends a SessionStart hook next to the hooks already there, backing each file up first:
+  Claude Code (~/.claude/settings.json), Codex (~/.codex/hooks.json),
+  Grok (~/.grok/hooks/agent-resume.json), Antigravity (~/.gemini/config/hooks.json),
+  Kiro V3 (~/.kiro/hooks/agent-resume.json).
+  Pi gets an extension in ~/.pi/agent/extensions/;
 - notes Claude Code sessions that are already running (`agent_resume.py adopt`);
 - with `--auto`, adds a few lines to fish, bash and zsh's startup files so a restored
   terminal starts its agent again by itself (`--no-auto` takes them out).
@@ -24,7 +27,7 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parents[1]
 MOD_NAME = "agent-resume"
 PACKAGE = "herdr-agent-resume"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MARKER = ".agent-resume-install.json"
 FILES = ("main.js", "summary.js", "mod.json", "agent_resume.py")
 GENERATED = {"gpui-kit.d.ts", "jsconfig.json", "__pycache__"}
@@ -208,6 +211,14 @@ def shell_changes(home, script, mode):
     return changes
 
 
+def write_hook(path, config):
+    """Write a hook file. A dedicated agent-resume.json that no longer has hooks is removed."""
+    if path.name == "agent-resume.json" and vacant(config):
+        path.unlink(missing_ok=True)
+        return
+    atomic_json(path, config)
+
+
 def write_text(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".agent-resume-", delete=False) as stream:
@@ -241,24 +252,141 @@ def verify_installed(destination, marker):
             raise ValueError(f"Installed file was edited: {path}. Preserve that edit before updating.")
 
 
+def agy_ours(block):
+    if not isinstance(block, dict):
+        return False
+    for event in ("SessionStart", "PreInvocation"):
+        for handler in block.get(event) or []:
+            if isinstance(handler, dict) and HOOK_TAG in str(handler.get("command", "")):
+                return True
+    return False
+
+
+def add_agy_hook(config, command):
+    """Antigravity's hooks.json is a map of hook name to events, not Claude's `hooks` object."""
+    merged = json.loads(json.dumps(config))
+    current = merged.get("agent-resume")
+    if current is not None and not agy_ours(current):
+        raise ValueError("hooks.json already has an agent-resume hook that isn't this mod's. No files changed.")
+    merged["agent-resume"] = {
+        "SessionStart": [{"type": "command", "command": command, "timeout": 10}],
+        "PreInvocation": [{"type": "command", "command": command, "timeout": 10}],
+    }
+    return merged
+
+
+def remove_agy_hook(config):
+    merged = json.loads(json.dumps(config))
+    if agy_ours(merged.get("agent-resume")):
+        del merged["agent-resume"]
+    return merged
+
+
+def _kiro_ours(hook):
+    if not isinstance(hook, dict):
+        return False
+    if str(hook.get("name", "")).startswith("agent-resume-"):
+        return True
+    action = hook.get("action")
+    return isinstance(action, dict) and HOOK_TAG in str(action.get("command", ""))
+
+
+def add_kiro_hook(config, command):
+    """Kiro V3 global hooks apply to every profile, including the built-in agent."""
+    merged = json.loads(json.dumps(config))
+    hooks = merged.get("hooks")
+    if hooks is None:
+        hooks = []
+    elif not isinstance(hooks, list):
+        raise ValueError("Kiro hooks file `hooks` is not a list. No files changed.")
+    kept = [hook for hook in hooks if not _kiro_ours(hook)]
+    for trigger in ("SessionStart", "UserPromptSubmit"):
+        kept.append({
+            "name": f"agent-resume-{trigger}",
+            "trigger": trigger,
+            "action": {"type": "command", "command": command},
+            "timeout": 10,
+        })
+    merged["hooks"] = kept
+    merged.setdefault("version", "v1")
+    return merged
+
+
+def remove_kiro_hook(config):
+    merged = json.loads(json.dumps(config))
+    hooks = merged.get("hooks")
+    if isinstance(hooks, list):
+        merged["hooks"] = [hook for hook in hooks if not _kiro_ours(hook)]
+    return merged
+
+
+def hook_edit(kind, config, command, remove):
+    if kind == "agy":
+        return remove_agy_hook(config) if remove else add_agy_hook(config, command)
+    if kind == "kiro":
+        return remove_kiro_hook(config) if remove else add_kiro_hook(config, command)
+    return remove_hook(config) if remove else add_hook(config, command)
+
+
+def vacant(config):
+    """True when a hook file we created would hold nothing but an empty hooks list."""
+    if any(key not in ("hooks", "version") for key in config):
+        return False
+    hooks = config.get("hooks")
+    return hooks in (None, {}, [])
+
+
+def pi_extension(script):
+    template = (ROOT / "scripts" / "pi_extension.js").read_text()
+    if "__SCRIPT__" not in template:
+        raise ValueError("pi extension template has no __SCRIPT__ placeholder")
+    return template.replace("__SCRIPT__", json.dumps(str(script)))
+
+
+def pi_changes(home, script, remove):
+    """(path, new text or None to delete) for Pi's extension, when Pi is set up here."""
+    agent = home / ".pi" / "agent"
+    if not agent.is_dir():
+        return []
+    path = agent / "extensions" / "herdr-agent-resume.js"
+    if remove:
+        if path.is_file() and "herdr-agent-resume pi session hook" in path.read_text():
+            return [(path, None)]
+        return []
+    text = pi_extension(script)
+    if path.is_file() and path.read_text() == text:
+        return []
+    return [(path, text)]
+
+
 def agent_configs(home):
-    """(name, path, existing config) for each agent that is set up on this machine."""
+    """(name, path, existing config, kind) for each agent that is set up on this machine.
+
+    `kind` is how that file lists hooks: "group" (Claude's SessionStart groups),
+    "agy" (a named block) or "kiro" (a list of trigger entries)."""
+    specs = (
+        ("claude", ".claude", "settings.json", "group"),
+        ("codex", ".codex", "hooks.json", "group"),
+        ("grok", ".grok", "hooks/agent-resume.json", "group"),
+        ("agy", ".gemini", "config/hooks.json", "agy"),
+        ("kiro", ".kiro", "hooks/agent-resume.json", "kiro"),
+    )
     out = []
-    for name, folder, file in (("claude", ".claude", "settings.json"), ("codex", ".codex", "hooks.json")):
+    for name, folder, file, kind in specs:
         if not (home / folder).is_dir():
             continue
         path = home / folder / file
         config = json.loads(path.read_text()) if path.exists() else {}
         if not isinstance(config, dict):
             raise ValueError(f"{path} is not a JSON object")
-        out.append((name, path, config))
+        out.append((name, path, config, kind))
     return out
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--app-home", type=Path, default=Path(os.environ.get("HERDR_APP_HOME", Path.home() / ".config/herdr-app")))
-    parser.add_argument("--home", type=Path, default=Path.home(), help="where ~/.claude and ~/.codex live")
+    parser.add_argument("--home", type=Path, default=Path.home(), help="where ~/.claude, ~/.codex, ~/.grok, ~/.gemini, ~/.pi and ~/.kiro live")
     parser.add_argument("--update", action="store_true", help="update files previously installed by this script")
     parser.add_argument("--uninstall", action="store_true")
     parser.add_argument("--no-adopt", action="store_true", help="don't note Claude Code sessions already running")
@@ -279,28 +407,30 @@ def main():
         raise ValueError("--auto and --no-auto can't go together")
     mode = "remove" if args.uninstall or args.no_auto else "add" if args.auto else "refresh"
     shells = shell_changes(home, script, mode)
+    pi = pi_changes(home, script, args.uninstall)
 
     if args.uninstall:
         keys = remove_keys(json.loads(keys_path.read_text()), snippet)
-        changes = [(path, remove_hook(config)) for _, path, config in configs]
-        changes = [(path, new) for (path, new), (_, _, old) in zip(changes, configs) if new != old]
+        edited = [(path, hook_edit(kind, config, None, True)) for _, path, config, kind in configs]
     else:
         keys = merge_keys(json.loads(keys_path.read_text()), snippet)
-        changes = [(path, add_hook(config, hook_command(script, name))) for name, path, config in configs]
-        changes = [(path, new) for (path, new), (_, _, old) in zip(changes, configs) if new != old]
+        edited = [(path, hook_edit(kind, config, hook_command(script, name), False)) for name, path, config, kind in configs]
         if destination.exists():
             marker_path = destination / MARKER
             if not args.update or not marker_path.exists():
                 raise ValueError(f"{destination} already exists. Use --update only for this installer's own files.")
             verify_installed(destination, json.loads(marker_path.read_text()))
         subprocess.run(["herdr-app", "check", str(source)], env=env, check=True)
+    changes = [(path, new) for (path, new), (_, _, old, _) in zip(edited, configs) if new != old]
 
     print(f"Mod: {destination}\nShortcut: Ctrl+Shift+R")
     for path, _ in changes:
         print(f"Hook: {path}")
+    for path, text in pi:
+        print(f"{'Pi extension removed' if text is None else 'Pi extension'}: {path}")
     for path, text in shells:
         print(f"{'Startup lines removed' if text is None or BEGIN not in text else 'Startup lines'}: {path}")
-    hooked = {name for name, _, _ in configs}
+    hooked = {name for name, _, _, _ in configs}
     if args.dry_run:
         print("Dry run: no files changed.")
         return
@@ -309,9 +439,12 @@ def main():
     backup = app / "backups" / MOD_NAME / stamp
     backup.mkdir(parents=True)
     shutil.copy2(keys_path, backup / "keys.json")
-    for name, path, _ in configs:
+    for name, path, _, _ in configs:
         if path.exists():
             shutil.copy2(path, backup / f"{name}-{path.name}")
+    for path, _ in pi:
+        if path.exists():
+            shutil.copy2(path, backup / f"pi-{path.name}")
     for path, _ in shells:
         if path.exists():
             shutil.copy2(path, backup / f"shell-{path.name.lstrip('.')}")
@@ -320,8 +453,9 @@ def main():
 
     if args.uninstall:
         for path, config in changes:
-            atomic_json(path, config)
+            write_hook(path, config)
         atomic_json(keys_path, keys)
+        apply_shell(pi)
         apply_shell(shells)
         if destination.exists():
             shutil.rmtree(destination)
@@ -345,7 +479,8 @@ def main():
         replaced = True
         atomic_json(keys_path, keys)
         for path, config in changes:
-            atomic_json(path, config)
+            write_hook(path, config)
+        apply_shell(pi)
         apply_shell(shells)
     except Exception:
         if replaced and destination.exists():
@@ -353,10 +488,19 @@ def main():
         if previous.exists():
             previous.replace(destination)
         shutil.copy2(backup / "keys.json", keys_path)
-        for name, path, _ in configs:
+        for name, path, _, _ in configs:
             saved = backup / f"{name}-{path.name}"
             if saved.exists():
                 shutil.copy2(saved, path)
+            elif path.name == "agent-resume.json":
+                path.unlink(missing_ok=True)
+        for path, _ in pi:
+            saved = backup / f"pi-{path.name}"
+            if saved.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(saved, path)
+            else:
+                path.unlink(missing_ok=True)
         for path, _ in shells:
             saved = backup / f"shell-{path.name.lstrip('.')}"
             if saved.exists():
@@ -381,7 +525,9 @@ def main():
             print(f"Couldn't note running sessions: {(adopted.stderr or adopted.stdout).strip()}")
     if "codex" in hooked and any(path.parent.name == ".codex" for path, _ in changes):
         print("Codex asks you to review the new hook the next time it starts: choose to trust it.")
-    print("New Claude Code sessions pick up the hook when they start; running ones keep their old hooks.")
+    if "grok" in hooked and any(path.parent.name == "hooks" and path.name == "agent-resume.json" and ".grok" in path.parts for path, _ in changes):
+        print("Grok runs the new hook after you trust the folder.")
+    print("New sessions pick up the hook when they start; running ones keep their old hooks.")
     if any(text and BEGIN in text for _, text in shells):
         print("Restored terminals now start their agent again by themselves; Ctrl+Shift+R still works for the rest.")
     elif args.no_auto:

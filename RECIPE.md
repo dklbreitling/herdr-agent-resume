@@ -1,6 +1,6 @@
 # Agent resume
 
-Restarting the machine kills every agent. Herdr brings each terminal back as a bare shell in its last folder, but it never runs the program again, so Claude Code and Codex chats are gone from their panes. This mod brings them back: a small SessionStart hook notes which session runs in which terminal, and Ctrl+Shift+R types `claude --resume <id>` or `codex resume <id>` into each terminal that lost its agent and sits at a shell. A toast says what came back.
+Restarting the machine kills every agent. Herdr brings each terminal back as a bare shell in its last folder, but it never runs the program again, so the chat that was running there is gone. This mod brings it back: a small session hook notes which session runs in which terminal, and Ctrl+Shift+R types that agent's resume command into each terminal that lost its agent and sits at a shell. A toast says what came back.
 
 ![Agent resume](preview.png)
 
@@ -10,7 +10,7 @@ Restarting the machine kills every agent. Herdr brings each terminal back as a b
 
 - Nothing until you press Ctrl+Shift+R. Installed with `--auto`, a restored terminal shows one dim line, `agent-resume: claude --resume <id> in <folder>`, and the agent opens on its old conversation as soon as the shell is up, with no popup or toast.
 - Then a popup pill, 340×40 px, centered at the top of the window 44 px down: the theme's `popover` background, a 1 px `border` outline, 10 px corners, 14 px side padding. Inside, 10 px apart: a 12 px braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, 80 ms a frame) in `accent`, and 13 px `foreground` text, "Looking for agents to resume…", truncated with an ellipsis. It closes by itself when the pass ends: within a second when there's nothing to resume, about 5 s after typing when there is (it checks the agents came up).
-- In each terminal that gets its agent back, the shell shows the typed command, `cd '<folder>' && claude --resume <id>` (or `codex resume <id>`), and the agent opens on its old conversation, idle.
+- In each terminal that gets its agent back, the shell shows the typed command, `cd '<folder>' && claude --resume <id>` (or `codex resume <id>`, `grok --resume <id>`, `agy --conversation <id>`, `pi --session <id>`, `python3 <mod>/agent_resume.py launch-kiro <id>`), and the agent opens on its old conversation, idle.
 - Then a toast, one line of body:
   - success, "Resumed 3 agents", body the terminals' `space / tab`, 5 s;
   - warning, "Resumed 2 of 3 agents", body "Not resumed: web / 2: something else is running there", 8 s;
@@ -21,7 +21,11 @@ Restarting the machine kills every agent. Herdr brings each terminal back as a b
 
 ## How it behaves
 
-- **Noting sessions.** A SessionStart hook for Claude Code and Codex runs `agent_resume.py hook claude|codex`. Inside a Herdr terminal (`HC_TERMINAL_ID` set), it sets the label `agent-resume` on that terminal to compact JSON: `agent`, `session`, `cwd`, `transcript`, `args`, `pid` (the agent), `shell` (the terminal's program), `boot` (Linux `boot_id`, macOS `kern.boottime`) and `at`.
+- **Noting sessions.** A session hook runs `agent_resume.py hook claude|codex|grok|agy|pi|kiro`. Inside a Herdr terminal (`HC_TERMINAL_ID` set), it sets the label `agent-resume` on that terminal to compact JSON: `agent`, `session`, `cwd`, `transcript`, `args`, `pid` (the agent), `shell` (the terminal's program), `boot` (Linux `boot_id`, macOS `kern.boottime`) and `at`.
+  - Claude Code, Codex and Grok send Claude-shaped JSON (`session_id`, `transcript_path`, `cwd`, `hook_event_name`). Grok also sends camelCase (`sessionId`, `transcriptPath`, `hookEventName`) and `GROK_SESSION_ID`.
+  - Antigravity sends `conversationId`, `workspacePaths` and `transcriptPath`, on `SessionStart` and on `PreInvocation`. The hook prints `{}`, because Antigravity reads stdout as JSON.
+  - Pi has no shell hook. `scripts/pi_extension.js` is installed at `~/.pi/agent/extensions/herdr-agent-resume.js` and sends the same Claude-shaped JSON from `session_start` and `agent_end`, once the session file exists.
+  - Kiro V3 sends `session_id` and `cwd` on `SessionStart` and `UserPromptSubmit`. Its global hooks apply to the built-in agent and custom profiles. Session metadata lives at `~/.kiro/sessions/<workspace-hash>/<session>/session.json`; existing buckets are searched before computing the single-workspace hash. Only V3 `sess_` ids are accepted, and resume explicitly selects `--v3`. V3 defers hooks until a prompt, including on resume. Both auto-resume and the typed `launch-kiro <session>` wrapper therefore run Kiro as a foreground child, record its new PID and shell, and clear its label on exit. Quick startup failures restore the old label for retry; a core shutdown leaves the label persisted. The nearest Kiro helper can be promoted through its runtime/launcher chain, stopping at shells and the first CLI launcher; normal ancestry checks then reject nested agents of every kind, including Kiro inside Kiro. Foreground state never substitutes an unrelated PID. Grok and Antigravity use their own transcript fallbacks (`~/.grok/sessions/<encoded-cwd>/<id>/updates.jsonl`, `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`).
   - `args` are the agent's launch flags worth keeping, read from `/proc/<pid>/cmdline` (Linux only) and filtered through `KEEP_FLAGS`: an allowlist per agent with each flag's number of values, limited to flags that agent's resume command accepts. Prompts, session pickers (`--resume`, `--continue`, `--session-id`), `-p`/`--print`, `--worktree` and unknown flags are dropped. A label read back is filtered again, so a label can never carry more.
   - Claude Code runs it on start, `/resume`, `/clear` and compact.
   - Codex runs it at the first turn of a session, not when it opens, so a Codex window nobody typed into isn't noted. There's nothing to resume in it anyway.
@@ -56,13 +60,13 @@ Restarting the machine kills every agent. Herdr brings each terminal back as a b
 - `main.js`: the popup view. `init` runs `exec("python3", [appHome() + "/mods/agent-resume/agent_resume.py", "resume"])` in `cx.spawn`, parses the JSON, posts `notify(summary(out))` and always ends with `closeOverlay(props().overlay)`. `render` is an `h_flex` with a `div().frames(SPIN, 80)` spinner and a `truncate()` label. Herdr functions: `exec`, `appHome`, `theme`, `props`, `closeOverlay`, `notify`.
 - `summary.js`: the toast text, no `herdr` imports.
 - `agent_resume.py`: Python 3.8+, standard library only. Commands `hook`, `watch`, `resume`, `status` (a dry run), `here` (automatic resume), `adopt` (notes running Claude Code sessions from `~/.claude/sessions/<pid>.json`). It runs `hc` (`ls`, `get`, `label`, `send`), reads `/proc` (or `ps`, `sysctl`), and writes only `data/agent-resume/log.jsonl` (trimmed to 256 KiB) and lock files under `$XDG_RUNTIME_DIR`. It never reaches the network.
-- **Installing also needs the hooks.** Append one group to `SessionStart` in `~/.claude/settings.json` and in `~/.codex/hooks.json`, after the existing ones (Codex trusts hooks by position), backing both files up first:
+- **Installing also needs the hooks.** For each agent whose directory already exists, append its hook after the ones already there (Codex trusts hooks by position), backing the file up first. Claude Code and Codex (and Grok, whose file is Claude-shaped) get one `SessionStart` group:
 
   ```json
   { "hooks": [{ "type": "command", "command": "python3 '/home/you/.config/herdr-app/mods/agent-resume/agent_resume.py' hook claude", "timeout": 10 }] }
   ```
 
-  (`hook codex` in Codex's file.) `scripts/install.py` does all of it: copy, key, both hooks, `adopt`; `--update`, `--uninstall`, `--dry-run`; `--auto` / `--no-auto` add or remove the shell startup block (backed up first; `--update` refreshes a block that's there).
+  (`hook codex` in Codex's file, `hook grok` in `~/.grok/hooks/agent-resume.json`.) Antigravity gets a named `agent-resume` block in `~/.gemini/config/hooks.json` with `SessionStart` and `PreInvocation`. Kiro V3 gets global `SessionStart` and `UserPromptSubmit` hooks in `~/.kiro/hooks/agent-resume.json`. The installer never creates or edits Kiro profiles or changes `chat.defaultAgent`; uninstall removes only this mod's global hooks. Pi gets the extension above, with the installed script path filled in. `scripts/install.py` does all of it: copy, key, the hooks, `adopt`; `--update`, `--uninstall`, `--dry-run`; `--auto` / `--no-auto` add or remove the shell startup block (backed up first; `--update` refreshes a block that's there). An `agent-resume.json` that holds nothing else is deleted on uninstall.
 
 ## Watch out
 
@@ -70,7 +74,7 @@ Restarting the machine kills every agent. Herdr brings each terminal back as a b
 - Codex shows "Hooks need review" the next time it starts after install. Until the person trusts the hook, Codex sessions aren't noted.
 - `hc send` from inside a Herdr terminal wraps the text in `<hc from="tN">…</hc>` for agents. The pass drops `HC_TERMINAL_ID` and `HC_SCOPE` for its sends, so they're plain even when run from a terminal.
 - The `cd` matters. `claude --resume <id>` finds a session only from its project folder, and Codex works in whatever folder it's started in. A restored shell starts in the terminal's last folder, which isn't always the session's: the agent may have moved into a worktree, or the terminal was started elsewhere.
-- Session ids are checked against `^[A-Za-z0-9][A-Za-z0-9-]{7,127}$` before they're typed; folders go between single quotes.
+- Session ids are checked against `^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$` before they're typed (the extra `.` and `_` are for Pi custom ids and Kiro's `sess_` ids); folders go between single quotes.
 - The hook must never get in the agent's way: it prints nothing, gives `hc` 3 s, and swallows every error into the log.
 - `claude --resume` may continue under a new id; the hook follows it.
 - A folder Claude Code hasn't been told to trust stops at its trust prompt.

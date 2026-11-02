@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+from io import StringIO
 from pathlib import Path
 import tempfile
 import time
@@ -78,6 +79,13 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(ar.command(label(cwd="/a b/c")), f"cd '/a b/c' && claude --resume {SID}")
         self.assertEqual(ar.command(label(agent="codex", session=SID2)), f"cd '/work' && codex resume {SID2}")
 
+    def test_grok_agy_pi_and_kiro(self):
+        self.assertEqual(ar.command(label(agent="grok")), f"cd '/work' && grok --resume {SID}")
+        self.assertEqual(ar.command(label(agent="agy")), f"cd '/work' && agy --conversation {SID}")
+        self.assertEqual(ar.command(label(agent="pi")), f"cd '/work' && pi --session {SID}")
+        self.assertTrue(ar.command(label(agent="kiro", session="sess_0123abcd")).endswith("launch-kiro sess_0123abcd"))
+        self.assertTrue(ar.valid_session("custom.id_1"))
+
     def test_refuses_folders_that_cannot_be_typed_safely(self):
         for cwd in ("/it's", "/back\\slash", "/new\nline", "relative", "", None):
             self.assertIsNone(ar.command(label(cwd=cwd)), repr(cwd))
@@ -121,6 +129,20 @@ class FlagTests(unittest.TestCase):
         self.assertEqual(ar.resume_argv(lbl), ["claude", "--resume", SID, "--append-system-prompt", "don't", "--model", "opus"])
         codex = {**label(agent="codex", session=SID2), "args": ["-c", "a=b", "-s", "workspace-write"]}
         self.assertEqual(ar.command(codex), f"cd '/work' && codex resume {SID2} -c a=b -s workspace-write")
+
+    def test_keeps_flags_the_other_resume_commands_accept(self):
+        self.assertEqual(ar.launch_flags("grok", ["--resume", SID, "--model", "grok-4", "--always-approve",
+                                                  "-c", "--permission-mode", "plan", "--worktree", "feat", "-p", "fix"]),
+                         [["--model", "grok-4"], ["--always-approve"], ["--permission-mode", "plan"]])
+        self.assertEqual(ar.launch_flags("agy", ["--conversation", SID, "--continue", "--model", "gemini",
+                                                 "--dangerously-skip-permissions", "-p", "fix it"]),
+                         [["--model", "gemini"], ["--dangerously-skip-permissions"]])
+        self.assertEqual(ar.launch_flags("pi", ["--continue", "--model", "gpt-5", "--session", SID,
+                                                "--thinking", "high", "--no-session", "-p", "hi"]),
+                         [["--model", "gpt-5"], ["--thinking", "high"]])
+        self.assertEqual(ar.launch_flags("kiro", ["chat", "--resume-id", SID, "--model", "claude",
+                                                  "--trust-all-tools", "--no-interactive", "hello"]),
+                         [["--model", "claude"], ["--trust-all-tools"]])
 
 
 class FailureTests(unittest.TestCase):
@@ -256,7 +278,12 @@ class ProcessTreeTests(unittest.TestCase):
             # 70 codex -> 60 node (codex.js) -> 30 fish
             70: (60, {"codex"}), 60: (30, {"node"}),
             # 15 claude in tmux -> 10 tmux server -> 1
-            15: (10, {"claude"}), 10: (1, {"tmux: server"})}
+            15: (10, {"claude"}), 10: (1, {"tmux: server"}),
+            # Kiro's own launcher: 110 helper -> bun -> kiro-cli-chat -> kiro-cli -> fish
+            85: (30, {"kiro-cli"}), 95: (85, {"kiro-cli-chat"}), 100: (95, {"bun"}), 110: (100, {"kiro-cli-chat"}),
+            # The same launcher under grok, which is a different agent.
+            46: (30, {"grok"}), 86: (46, {"kiro-cli"}), 96: (86, {"kiro-cli-chat"}),
+            101: (96, {"bun"}), 111: (101, {"kiro-cli-chat"})}
 
     def lookup(self, pid):
         if pid not in self.TREE:
@@ -275,6 +302,9 @@ class ProcessTreeTests(unittest.TestCase):
         self.assertEqual(ar.placement(90, 30, self.lookup), "nested")
         self.assertEqual(ar.placement(15, 30, self.lookup), "outside")
         self.assertEqual(ar.placement(30, 30, self.lookup), "direct")  # the agent is the terminal's program
+        self.assertEqual(ar.placement(110, 30, self.lookup), "nested")  # parent kiro-cli counts as another agent
+        self.assertEqual(ar.placement(ar.kiro_launcher(110, self.lookup), 30, self.lookup), "direct")
+        self.assertEqual(ar.placement(ar.kiro_launcher(111, self.lookup), 30, self.lookup), "nested")  # grok is in between
 
 
 class HookTests(unittest.TestCase):
@@ -302,6 +332,124 @@ class HookTests(unittest.TestCase):
             self.assertEqual(ar.hook("codex", self.payload(), env={**self.ENV, "CODEX_THREAD_ID": SID}), "saved")
         remember.assert_called_once_with("t7", "codex", SID, "/work", "/t/x.jsonl", 40, 30)
 
+    def saved(self, agent, raw, env=None):
+        with mock.patch.object(ar, "find_agent", return_value=40), \
+             mock.patch.object(ar, "hc_json", return_value={"state": "live", "pid": 30}), \
+             mock.patch.object(ar, "placement", return_value="direct"), \
+             mock.patch.object(ar, "remember") as remember:
+            outcome = ar.hook(agent, raw, env={**self.ENV, **(env or {})})
+        return outcome, remember
+
+    def test_grok_agy_pi_and_kiro_payloads(self):
+        outcome, remember = self.saved("grok", json.dumps({
+            "hookEventName": "session_start", "sessionId": SID, "cwd": "/work", "transcriptPath": "/t/x.jsonl"}))
+        self.assertEqual(outcome, "saved")
+        remember.assert_called_once_with("t7", "grok", SID, "/work", "/t/x.jsonl", 40, 30)
+
+        outcome, remember = self.saved("grok", json.dumps({"hook_event_name": "SessionStart", "cwd": "/work"}),
+                                       env={"GROK_SESSION_ID": SID})
+        self.assertEqual(outcome, "saved")
+        self.assertTrue(remember.call_args[0][4].endswith(f"/.grok/sessions/%2Fwork/{SID}/updates.jsonl"))
+
+        outcome, remember = self.saved("agy", json.dumps({
+            "conversationId": SID, "workspacePaths": ["/work"], "transcriptPath": "/t/x.jsonl"}))
+        self.assertEqual(outcome, "saved")
+        remember.assert_called_once_with("t7", "agy", SID, "/work", "/t/x.jsonl", 40, 30)
+
+        outcome, remember = self.saved("agy", json.dumps({
+            "hookEventName": "PreInvocation", "conversationId": SID, "workspacePaths": ["/repo"],
+            "transcriptPath": "/t/x.jsonl"}))
+        self.assertEqual(outcome, "saved")
+        self.assertEqual(remember.call_args[0][3], "/repo")
+
+        outcome, remember = self.saved("pi", self.payload())
+        self.assertEqual(outcome, "saved")
+        remember.assert_called_once_with("t7", "pi", SID, "/work", "/t/x.jsonl", 40, 30)
+
+        outcome, remember = self.saved("kiro", json.dumps({
+            "hook_event_name": "SessionStart", "session_id": "sess_" + SID, "cwd": "/proj"}))
+        self.assertEqual(outcome, "saved")
+        self.assertEqual(remember.call_args[0][3], "/proj")
+        self.assertTrue(remember.call_args[0][4].endswith(f"/sess_{SID}/session.json"))
+
+        outcome, remember = self.saved("kiro", json.dumps({
+            "hook_event_name": "UserPromptSubmit", "session_id": "sess_" + SID, "cwd": "/proj", "prompt": "hi"}))
+        self.assertEqual(outcome, "saved")
+
+        self.assertEqual(ar.hook("grok", json.dumps({"hook_event_name": "SessionStart", "session_id": SID,
+                                                    "subagentType": "explore", "transcript_path": "/t/x.jsonl",
+                                                    "cwd": "/work"}), env=self.ENV), "subagent")
+        self.assertIsNone(ar.default_transcript("claude", SID, "/work"))
+        self.assertIsNone(ar.default_transcript("pi", SID, "/work"))
+
+    def test_a_repeat_of_the_same_session_does_not_note_it_again(self):
+        lbl = label(agent="agy", shell=30, pid=40)
+        terminal = {"state": "live", "pid": 30, "labels": {ar.LABEL: json.dumps(lbl)}}
+        with mock.patch.object(ar, "find_agent", return_value=40), \
+             mock.patch.object(ar, "hc_json", return_value=terminal), \
+             mock.patch.object(ar, "placement", return_value="direct"), \
+             mock.patch.object(ar, "remember") as remember:
+            outcome = ar.hook("agy", json.dumps({"conversationId": SID, "workspacePaths": ["/work"],
+                                                 "transcriptPath": lbl["transcript"]}), env=self.ENV)
+        self.assertEqual(outcome, "already noted")
+        remember.assert_not_called()
+
+    def test_hook_stdout_stays_quiet_except_where_the_agent_requires_it(self):
+        with mock.patch.object(ar, "hook", return_value="saved"), \
+             mock.patch.object(ar, "log"), \
+             mock.patch("sys.stdin", StringIO("{}")):
+            for agent, expected in (("claude", ""), ("agy", "{}\n"), ("pi", "saved\n")):
+                with mock.patch("sys.stdout", new_callable=StringIO) as out:
+                    self.assertEqual(ar.main(["agent_resume.py", "hook", agent]), 0)
+                self.assertEqual(out.getvalue(), expected, agent)
+
+    def test_process_ancestry_preserves_outer_session(self):
+        # Real find_agent/placement logic; only the OS and label write are mocked.
+        for agent, name in (("claude", "claude"), ("codex", "codex"), ("kiro", "kiro-cli")):
+            for nested in (False, True):
+                tree = {30: {"ppid": 1, "names": {"fish"}},
+                        40: {"ppid": 30, "names": {name}},
+                        70: {"ppid": 40, "names": {"bash"}},
+                        90: {"ppid": 70, "names": {name}},
+                        100: {"ppid": 90 if nested else 40, "names": {"sh"}}}
+                if agent == "kiro":
+                    tree[100]["ppid"] = 110
+                    tree[110] = {"ppid": 120, "names": {"kiro-cli-chat"}}
+                    tree[120] = {"ppid": 130, "names": {"bun"}}
+                    tree[130] = {"ppid": 90 if nested else 40, "names": {"kiro-cli-chat"}}
+                terminal = {"state": "live", "pid": 30, "foreground": {"pid": 40, "name": name}}
+                sid = "sess_" + SID if agent == "kiro" else SID
+                with self.subTest(agent=agent, nested=nested), \
+                     mock.patch.object(ar, "_proc_linux", side_effect=tree.get), \
+                     mock.patch.object(ar.os.path, "isdir", return_value=True), \
+                     mock.patch.object(ar.os, "getppid", return_value=100), \
+                     mock.patch.object(ar, "hc_json", return_value=terminal), \
+                     mock.patch.object(ar, "remember") as remember:
+                    outcome = ar.hook(agent, self.payload(session_id=sid), env=self.ENV)
+                if nested:
+                    self.assertEqual(outcome, "agent runs nested")
+                    remember.assert_not_called()
+                else:
+                    self.assertEqual(outcome, "saved")
+                    self.assertEqual(remember.call_args.args[5], 40)
+
+    def test_kiro_only_accepts_v3_sessions(self):
+        self.assertEqual(ar.hook("kiro", self.payload(), env=self.ENV), "Kiro V2 is not supported")
+        self.assertIsNone(ar.read_label({ar.LABEL: json.dumps(label(agent="kiro"))}))
+        self.assertFalse(ar.is_session_event("kiro", {"hook_event_name": "agentSpawn"}))
+
+    def test_kiro_metadata_location_and_forced_engine(self):
+        with tempfile.TemporaryDirectory() as home:
+            sid = "sess_" + SID
+            predicted = Path(ar.default_transcript("kiro", sid, "/proj", home))
+            self.assertEqual(predicted.name, "session.json")
+            metadata = Path(home, ".kiro", "sessions", "multiple-roots", sid, "session.json")
+            metadata.parent.mkdir(parents=True)
+            metadata.write_text('{}')
+            self.assertEqual(ar.default_transcript("kiro", sid, "/proj", home), str(metadata))
+            saved = {**label(agent="kiro", session=sid), "args": ["--v2", "--agent-engine", "v2", "--mode", "spec"]}
+            self.assertEqual(ar.resume_argv(saved), ["kiro-cli", "chat", "--v3", "--resume-id", sid, "--mode", "spec"])
+
     def test_skips_nested_agents(self):
         with mock.patch.object(ar, "find_agent", return_value=90), \
              mock.patch.object(ar, "hc_json", return_value={"state": "live", "pid": 30}), \
@@ -309,6 +457,44 @@ class HookTests(unittest.TestCase):
              mock.patch.object(ar, "remember") as remember:
             self.assertEqual(ar.hook("claude", self.payload(), env=self.ENV), "agent runs nested")
         remember.assert_not_called()
+
+
+class KiroLifecycleTests(unittest.TestCase):
+    def test_exit_without_a_prompt_forgets_session_and_failure_allows_retry(self):
+        original = label(agent="kiro", session="sess_" + SID, shell=10, pid=11)
+        current = {**original, "shell": 30, "pid": 40}
+        terminal = {"pid": 30, "labels": {ar.LABEL: json.dumps(current)}}
+        for code, elapsed, restore in ((0, 1, False), (130, 1, False), (1, 1, True), (1, 60, False)):
+            with self.subTest(code=code, elapsed=elapsed), \
+                 mock.patch.object(ar, "hc_json", return_value=terminal), \
+                 mock.patch.object(ar, "hc") as hc:
+                ar.kiro_finished("t7", original, 30, 40, code, elapsed)
+                value = hc.call_args.args[0][-1]
+                if restore:
+                    self.assertEqual(json.loads(value.split("=", 1)[1]), original)
+                else:
+                    self.assertEqual(value, ar.LABEL + "=")
+
+    def test_old_job_cannot_clear_a_replacement(self):
+        original = label(agent="kiro", session="sess_" + SID)
+        for shell, pid in ((30, 99), (99, 40)):
+            terminal = {"pid": shell, "labels": {ar.LABEL: json.dumps({**original, "pid": pid})}}
+            with mock.patch.object(ar, "hc_json", return_value=terminal), mock.patch.object(ar, "hc") as hc:
+                ar.kiro_finished("t7", original, 30, 40, 0, 60)
+                hc.assert_not_called()
+
+    def test_wrapper_records_child_before_waiting_and_keeps_launch_flags(self):
+        saved = {**label(agent="kiro", session="sess_" + SID), "args": ["--mode", "spec"]}
+        def run(argv, cwd, started):
+            self.assertIn("--v3", argv)
+            started(40)
+            return 0
+        with mock.patch.object(ar, "run_as_job", side_effect=run), \
+             mock.patch.object(ar, "remember") as remember, \
+             mock.patch.object(ar, "kiro_finished") as finish:
+            self.assertEqual(ar.run_kiro("t7", saved, 30), 0)
+        self.assertEqual(remember.call_args.kwargs, {"watcher": False, "launch_args": ["--mode", "spec"]})
+        self.assertEqual(finish.call_args.args[:5], ("t7", saved, 30, 40, 0))
 
 
 class ClaudeRegistryTests(unittest.TestCase):

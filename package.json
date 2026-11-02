@@ -1,7 +1,7 @@
 {
   "name": "herdr-agent-resume",
-  "version": "0.3.0",
-  "description": "Bring Claude Code and Codex sessions back after a reboot, in the Herdr desktop app",
+  "version": "0.4.0",
+  "description": "Bring coding-agent sessions back after a reboot, in the Herdr desktop app",
   "license": "MIT",
   "repository": {
     "type": "git",

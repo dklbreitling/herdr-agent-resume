@@ -1,7 +1,11 @@
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
+from contextlib import redirect_stdout
+from io import StringIO
 
 spec = importlib.util.spec_from_file_location("installer", Path(__file__).parents[1] / "scripts/install.py")
 installer = importlib.util.module_from_spec(spec)
@@ -52,6 +56,86 @@ class HookTests(unittest.TestCase):
         existing = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "herdr"}]}]}}
         self.assertEqual(installer.remove_hook(installer.add_hook(existing, CMD)), existing)
         self.assertEqual(installer.remove_hook(installer.add_hook({}, CMD)), {"hooks": {}})
+
+
+class OtherAgentHookTests(unittest.TestCase):
+    def test_agy_block_is_added_beside_other_hooks_and_removed(self):
+        cmd = installer.hook_command("/app/mods/agent-resume/agent_resume.py", "agy")
+        existing = {"herdr": {"PreInvocation": [{"command": "herdr", "type": "command"}]}}
+        merged = installer.add_agy_hook(existing, cmd)
+        self.assertEqual(merged["herdr"], existing["herdr"])
+        self.assertIn("hook agy", merged["agent-resume"]["SessionStart"][0]["command"])
+        self.assertEqual(len(merged["agent-resume"]["PreInvocation"]), 1)
+        self.assertEqual(installer.add_agy_hook(merged, cmd), merged)
+        moved = installer.add_agy_hook(merged, installer.hook_command("/elsewhere/agent_resume.py", "agy"))
+        self.assertIn("/elsewhere/", moved["agent-resume"]["SessionStart"][0]["command"])
+        self.assertEqual(installer.remove_agy_hook(moved), existing)
+        with self.assertRaisesRegex(ValueError, "isn't this mod's"):
+            installer.add_agy_hook({"agent-resume": {"SessionStart": [{"command": "mine"}]}}, cmd)
+
+    def test_kiro_entries_keep_the_other_hooks(self):
+        cmd = installer.hook_command("/app/agent_resume.py", "kiro")
+        existing = {"version": "v1", "hooks": [{"name": "other", "trigger": "Stop", "action": {"type": "command", "command": "x"}}]}
+        merged = installer.add_kiro_hook(existing, cmd)
+        self.assertEqual(merged["hooks"][0]["name"], "other")
+        self.assertEqual([hook["trigger"] for hook in merged["hooks"][1:]], ["SessionStart", "UserPromptSubmit"])
+        again = installer.add_kiro_hook(merged, installer.hook_command("/moved/agent_resume.py", "kiro"))
+        self.assertEqual(len(again["hooks"]), 3)
+        self.assertIn("/moved/", again["hooks"][1]["action"]["command"])
+        self.assertEqual(installer.remove_kiro_hook(again)["hooks"], existing["hooks"])
+
+    def test_install_update_uninstall_never_change_kiro_profiles_or_settings(self):
+        for default in (None, "kiro", "work"):
+            for preexisting in (False, True):
+                with self.subTest(default=default, preexisting=preexisting), tempfile.TemporaryDirectory() as directory:
+                    home = Path(directory)
+                    app = home / "app"
+                    app.mkdir()
+                    (app / "keys.json").write_text('{}')
+                    settings = home / ".kiro/settings/cli.json"
+                    settings.parent.mkdir(parents=True)
+                    original = json.dumps({"chat.defaultAgent": default, "other": 42})
+                    settings.write_text(original)
+                    agent = home / ".kiro/agents/kiro.json"
+                    if preexisting:
+                        agent.parent.mkdir()
+                        agent.write_text('{"name":"kiro","prompt":"mine"}')
+                    agent_before = agent.read_bytes() if agent.exists() else None
+                    base = ["install.py", "--home", str(home), "--app-home", str(app), "--no-adopt"]
+                    with mock.patch.object(installer.subprocess, "run") as run:
+                        for flag in ([], ["--update"], ["--uninstall"]):
+                            with mock.patch("sys.argv", base + flag), redirect_stdout(StringIO()):
+                                installer.main()
+                            self.assertEqual(settings.read_text(), original)
+                            self.assertEqual(agent.read_bytes() if agent.exists() else None, agent_before)
+                        self.assertTrue(all(call.args[0][0] == "herdr-app" for call in run.call_args_list))
+                    self.assertFalse((home / ".kiro/hooks/agent-resume.json").exists())
+
+    def test_pi_extension_points_at_the_script(self):
+        text = installer.pi_extension("/app/mods/agent-resume/agent_resume.py")
+        self.assertIn('"/app/mods/agent-resume/agent_resume.py"', text)
+        self.assertNotIn("__SCRIPT__", text)
+        self.assertIn("hook\", \"pi\"", text)
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".pi" / "agent").mkdir(parents=True)
+            added = installer.pi_changes(home, "/app/mods/agent-resume/agent_resume.py", False)
+            installer.apply_shell(added)
+            path = home / ".pi" / "agent" / "extensions" / "herdr-agent-resume.js"
+            self.assertEqual(path.read_text(), text)
+            self.assertEqual(installer.pi_changes(home, "/app/mods/agent-resume/agent_resume.py", False), [])
+            removed = installer.pi_changes(home, "/app/mods/agent-resume/agent_resume.py", True)
+            installer.apply_shell(removed)
+            self.assertFalse(path.exists())
+
+    def test_only_agents_set_up_on_this_machine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".grok").mkdir()
+            (home / ".gemini" / "config").mkdir(parents=True)
+            (home / ".kiro").mkdir()
+            found = {name: kind for name, _, _, kind in installer.agent_configs(home)}
+            self.assertEqual(found, {"grok": "group", "agy": "agy", "kiro": "kiro"})
 
 
 class ShellTests(unittest.TestCase):

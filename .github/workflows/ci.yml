@@ -43,7 +43,17 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m unittest discover -s tests -p 'test_*.py'
       - name: The script starts and prints its usage
-        run: python mods/agent-resume/agent_resume.py help 2>&1 | grep -q "SessionStart hook"
+        run: |
+          python - <<'PY'
+          import subprocess
+          import sys
+          result = subprocess.run(
+              [sys.executable, "mods/agent-resume/agent_resume.py", "help"],
+              capture_output=True, text=True,
+          )
+          assert result.returncode == 2, result
+          assert "Agent resume for the Herdr app" in result.stderr, result.stderr
+          PY
 
   shells:
     name: Startup lines parse (fish, bash, zsh)
